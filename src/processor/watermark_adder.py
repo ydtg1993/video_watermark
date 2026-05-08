@@ -22,37 +22,28 @@ class WatermarkAdder(QObject):
 
     @staticmethod
     def _estimate_text_size(text, fontsize):
-        chinese_cnt = sum(1 for c in text if '\u4e00' <= c <= '\u9fff')
-        other_cnt = len(text) - chinese_cnt
-        width = chinese_cnt * fontsize + other_cnt * fontsize * 0.6
+        """粗略估算文本高度（用于二分法），宽度不再限制"""
+        # 高度估算：字号 * 1.2 近似行高
         height = fontsize * 1.2
-        # 修正：中文字体上升部分通常占字号的 70% 左右，让文字整体上移不再偏下
-        ascent = fontsize * 0.7
-        return width, height, ascent
+        return height
 
     @classmethod
-    def _calc_adaptive_params(cls, text, rect, initial_fontfile):
+    def _calc_adaptive_fontsize(cls, text, rect):
+        """仅返回最佳字号（以高度填满选框为目标）"""
         rx, ry, rw, rh = [int(v) for v in rect]
-        target_w = rw * 0.85
-        target_h = rh * 0.9
+        target_h = rh * 0.98   # 高度填满 98%，留极小内边距
 
-        low, high = 8, 300
+        low, high = 8, 600
         best_size = 24
         while low <= high:
             mid = (low + high) // 2
-            w, h, _ = cls._estimate_text_size(text, mid)
-            if w <= target_w and h <= target_h:
+            h = cls._estimate_text_size(text, mid)
+            if h <= target_h:
                 best_size = mid
                 low = mid + 1
             else:
                 high = mid - 1
-
-        fontsize = best_size
-        text_w, text_h, ascent = cls._estimate_text_size(text, fontsize)
-
-        x_center = rx + (rw - text_w) // 2
-        y_baseline = ry + (rh - text_h) // 2 + ascent
-        return fontsize, x_center, y_baseline
+        return best_size
 
     def add_text(self, input_path, output_path, text, x, y, fontfile='',
                  fontsize=0, fontcolor='white', alpha=1.0, angle=0,
@@ -75,13 +66,15 @@ class WatermarkAdder(QObject):
 
         safe_text = self._escape(text)
 
+        # ---------- 自适应字号 ----------
         if rect and fontsize <= 0:
-            fontsize, draw_x, draw_y = self._calc_adaptive_params(
-                safe_text, rect, fontfile
-            )
+            fontsize = int(self._calc_adaptive_fontsize(safe_text, rect) * 1.05)
+            rx, ry, rw, rh = [int(v) for v in rect]
+            x_expr = f"{rx}+({rw}-tw)/2"
+            y_expr = f"{ry}+(({rh}-{fontsize})/2)"
         else:
-            draw_x = x
-            draw_y = y
+            x_expr = str(x)
+            y_expr = str(y)
             if fontsize <= 0:
                 fontsize = 24
 
@@ -92,12 +85,15 @@ class WatermarkAdder(QObject):
 
         drawtext = (
             f"drawtext=text='{safe_text}':"
-            f"x={draw_x}:y={draw_y}:"
+            f"x={x_expr}:"
+            f"y={y_expr}:"
             f"fontsize={fontsize}:"
             f"fontcolor={fontcolor}@{alpha}"
         )
         if fontfile_escaped:
             drawtext += f":fontfile='{fontfile_escaped}'"
+        # angle 等新版 FFmpeg 支持后可恢复
+        # drawtext += f":angle={angle}"
 
         filters.append(drawtext)
         vf = ",".join(filters)
@@ -143,8 +139,8 @@ class WatermarkAdder(QObject):
             concat_file = os.path.join(temp_dir, "concat.txt")
             with open(concat_file, "w", encoding="utf-8") as f:
                 for seg in segment_files:
-                    safe_path = seg.replace("\\", "/")
-                    f.write(f"file '{safe_path}'\n")
+                    abs_path = os.path.abspath(seg).replace("\\", "/")
+                    f.write(f"file '{abs_path}'\n")
 
             merge_cmd_copy = [
                 "ffmpeg", "-y",
