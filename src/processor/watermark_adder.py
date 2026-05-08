@@ -14,31 +14,52 @@ class WatermarkAdder(QObject):
     status_updated = Signal(str)
     finished = Signal(bool, str)
 
-    def add_text(self, input_path, output_path, text, x, y, fontfile="",
-                 fontsize=24, fontcolor="white", alpha=1.0, bold=False,
-                 italic=False, angle=0.0, encoder="libx264", quality="标准",
-                 remove_first=False, remove_rect=None):
-        tmp = tempfile.NamedTemporaryFile(
-            mode='w', suffix='.txt', delete=False, encoding='utf-8')
-        try:
-            tmp.write(text)
-            tmp.close()
+    def add_text(self, input_path: str, output_path: str,
+                 text: str, x: int, y: int, fontfile: str = "",
+                 fontsize: int = 24, fontcolor: str = "white",
+                 alpha: float = 1.0, bold: bool = False,
+                 italic: bool = False, angle: float = 0.0,
+                 encoder: str = "libx264", quality: str = "标准",
+                 remove_first: bool = False, remove_rect: tuple = None):
 
-            raw_path = tmp.name.replace('\\', '/')  # 路径统一
-            fontcolor_hex = self._color_to_hex(fontcolor)
-            vf = (
-                f"drawtext=textfile='{raw_path}':"
-                f"x={x}:y={y}:"
-                f"fontsize={fontsize}:fontcolor={fontcolor_hex}@"
-                f"{alpha}:angle={angle}"
-            )
+        # 安全转义文本
+        safe_text = self._escape_drawtext(text)
+        fontcolor_hex = self._color_to_hex(fontcolor)
 
-            self._process_segmented(input_path, output_path, vf,
-                                    encoder, quality,
-                                    remove_first, remove_rect)
-        finally:
-            if os.path.exists(tmp.name):
-                os.unlink(tmp.name)
+        # 构建 drawtext 滤镜 (文本用单引号包裹)
+        drawtext_vf = (
+            f"drawtext=text='{safe_text}':"
+            f"x={x}:y={y}:"
+            f"fontsize={fontsize}:fontcolor={fontcolor_hex}@"
+            f"{alpha}:angle={angle}"
+        )
+
+        # 如果同时要求先去水印
+        if remove_first and remove_rect:
+            rx, ry, rw, rh = remove_rect
+            delogo_vf = f"delogo=x={rx}:y={ry}:w={rw}:h={rh}:show=0"
+            combined_vf = f"{delogo_vf},{drawtext_vf}"
+        else:
+            combined_vf = drawtext_vf
+
+        self._process_segmented(input_path, output_path, combined_vf,
+                                encoder, quality)
+
+    @staticmethod
+    def _escape_drawtext(text: str) -> str:
+        """
+        对 drawtext 滤镜中 text= 的值进行 FFmpeg 要求的转义。
+        顺序很重要：先转义反斜杠，再转义冒号、单引号、逗号。
+        """
+        # 1. 反斜杠
+        text = text.replace('\\', '\\\\')
+        # 2. 冒号
+        text = text.replace(':', '\\:')
+        # 3. 单引号 (因为我们用单引号包裹文本)
+        text = text.replace("'", "\\'")
+        # 4. 逗号 (如果文本要和其他滤镜用逗号连接，则必须转义)
+        text = text.replace(',', '\\,')
+        return text
 
     def add_image(self, input_path: str, output_path: str,
                   image_path: str, x: int, y: int,
@@ -70,8 +91,8 @@ class WatermarkAdder(QObject):
                                            encoder, quality)
 
     def _process_segmented(self, input_path, output_path, vf,
-                           encoder, quality,
-                           remove_first=False, remove_rect=None):
+                           encoder, quality):
+        # 去掉 remove_first 和 remove_rect 参数，因为 vf 已经是完整的滤镜链
         duration = self._get_duration(input_path)
         if duration is None:
             self.finished.emit(False, "无法读取视频时长。")
@@ -82,25 +103,18 @@ class WatermarkAdder(QObject):
         temp_dir = tempfile.mkdtemp(prefix="adder_")
         segment_files = []
 
-        if remove_first and remove_rect:
-            rx, ry, rw, rh = remove_rect
-            delogo = f"delogo=x={rx}:y={ry}:w={rw}:h={rh}:show=0"
-            combined_vf = f"{delogo},{vf}"
-        else:
-            combined_vf = vf
-
         try:
             for i in range(num_segments):
                 start_time = i * segment_duration
                 seg_file = os.path.join(temp_dir, f"seg_{i:04d}.mp4")
 
-                self.status_updated.emit(f"正在处理片段 {i+1}/{num_segments} ...")
+                self.status_updated.emit(f"正在处理片段 {i + 1}/{num_segments} ...")
                 cmd = [
                     "ffmpeg",
                     "-ss", str(start_time),
                     "-i", input_path,
                     "-t", str(segment_duration),
-                    "-vf", combined_vf,
+                    "-vf", vf,  # ← 直接使用传入的完整 vf
                 ]
                 cmd.extend(self._build_encoder_params(encoder, quality))
                 cmd.extend(["-y", seg_file])
