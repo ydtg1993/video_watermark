@@ -5,6 +5,8 @@ import re
 from PySide6.QtCore import QObject, Signal
 from src.core.utils import get_video_duration, normalize_rect
 
+# 确保项目 temp 目录存在
+os.makedirs("temp", exist_ok=True)
 
 class WatermarkRemover(QObject):
     progress_updated = Signal(int)
@@ -28,7 +30,7 @@ class WatermarkRemover(QObject):
         segment_time = 30.0
         total_segments = max(1, int(duration / segment_time) + (1 if duration % segment_time else 0))
 
-        temp_dir = tempfile.mkdtemp(prefix="delogo_")
+        temp_dir = tempfile.mkdtemp(prefix="delogo_", dir="temp")
         segment_files = []
 
         try:

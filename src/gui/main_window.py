@@ -161,14 +161,6 @@ class MainWindow(QMainWindow):
         font_row.addWidget(self.font_combo)
         text_layout.addLayout(font_row)
 
-        size_row = QHBoxLayout()
-        size_row.addWidget(QLabel("字号"))
-        self.font_size = QSpinBox()
-        self.font_size.setRange(8, 300)
-        self.font_size.setValue(36)
-        size_row.addWidget(self.font_size)
-        text_layout.addLayout(size_row)
-
         color_row = QHBoxLayout()
         color_row.addWidget(QLabel("颜色"))
         self.color_combo = QComboBox()
@@ -301,7 +293,6 @@ class MainWindow(QMainWindow):
             idx = self.font_combo.findText(font)
             if idx >= 0:
                 self.font_combo.setCurrentIndex(idx)
-        self.font_size.setValue(self.settings.value("font_size", 36, type=int))
         color = self.settings.value("color", "white")
         idx = self.color_combo.findText(color)
         if idx >= 0:
@@ -340,7 +331,6 @@ class MainWindow(QMainWindow):
         self.settings.setValue("mode", self.mode_combo.currentIndex())
         self.settings.setValue("text", self.text_input.text())
         self.settings.setValue("font", self.font_combo.currentText())
-        self.settings.setValue("font_size", self.font_size.value())
         self.settings.setValue("color", self.color_combo.currentText())
         self.settings.setValue("text_alpha", self.text_alpha.value())
         self.settings.setValue("angle", self.angle_spin.value())
@@ -533,14 +523,15 @@ class MainWindow(QMainWindow):
                         output_path=save_path,
                         text=self.text_input.text(),
                         x=x, y=y,
-                        fontsize=self.font_size.value(),
+                        fontsize=0,   # 自适应
                         fontcolor=self.color_combo.currentText(),
                         alpha=self.text_alpha.value(),
                         fontfile=self.fontfile_edit.text().strip() or "",
                         encoder=encoder,
                         quality=quality,
                         remove_first=self.remove_before_add_check.isChecked(),
-                        remove_rect=self.watermark_rect
+                        remove_rect=self.watermark_rect,
+                        rect=self.watermark_rect
                     )
                 )
 
@@ -554,12 +545,10 @@ class MainWindow(QMainWindow):
 
                 self.worker = WatermarkAdder()
                 self.worker.moveToThread(self.worker_thread)
-
                 if self.scale_combo.currentIndex() == 0:
                     scale_w, scale_h = w, h
                 else:
                     scale_w, scale_h = 0, 0
-
                 self.worker_thread.started.connect(
                     lambda: self.worker.add_image(
                         input_path=self.video_path,

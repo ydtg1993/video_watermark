@@ -5,6 +5,8 @@ import re
 from PySide6.QtCore import QObject, Signal
 from src.core.utils import get_video_duration, get_default_font
 
+os.makedirs("temp", exist_ok=True)
+
 
 class WatermarkAdder(QObject):
     progress_updated = Signal(int)
@@ -18,30 +20,71 @@ class WatermarkAdder(QObject):
     def cancel(self):
         self._cancelled = True
 
+    @staticmethod
+    def _estimate_text_size(text, fontsize):
+        chinese_cnt = sum(1 for c in text if '\u4e00' <= c <= '\u9fff')
+        other_cnt = len(text) - chinese_cnt
+        width = chinese_cnt * fontsize + other_cnt * fontsize * 0.6
+        height = fontsize * 1.2
+        # 修正：中文字体上升部分通常占字号的 70% 左右，让文字整体上移不再偏下
+        ascent = fontsize * 0.7
+        return width, height, ascent
+
+    @classmethod
+    def _calc_adaptive_params(cls, text, rect, initial_fontfile):
+        rx, ry, rw, rh = [int(v) for v in rect]
+        target_w = rw * 0.85
+        target_h = rh * 0.9
+
+        low, high = 8, 300
+        best_size = 24
+        while low <= high:
+            mid = (low + high) // 2
+            w, h, _ = cls._estimate_text_size(text, mid)
+            if w <= target_w and h <= target_h:
+                best_size = mid
+                low = mid + 1
+            else:
+                high = mid - 1
+
+        fontsize = best_size
+        text_w, text_h, ascent = cls._estimate_text_size(text, fontsize)
+
+        x_center = rx + (rw - text_w) // 2
+        y_baseline = ry + (rh - text_h) // 2 + ascent
+        return fontsize, x_center, y_baseline
+
     def add_text(self, input_path, output_path, text, x, y, fontfile='',
-                 fontsize=24, fontcolor='white', alpha=1.0, angle=0,
+                 fontsize=0, fontcolor='white', alpha=1.0, angle=0,
                  encoder='libx264', quality='标准',
-                 remove_first=False, remove_rect=None):
+                 remove_first=False, remove_rect=None,
+                 rect=None):
         duration = get_video_duration(input_path)
         if duration is None:
             self.finished.emit(False, "无法读取视频时长")
             return
 
-        # 字体回退
         if not fontfile:
             fontfile = get_default_font()
+        if not fontfile:
+            self.finished.emit(False, "未找到有效的中文字体文件，请手动选择")
+            return
 
-        if fontfile:
-            # 路径处理：转义冒号，使用正斜杠，最后用单引号包裹
-            fontfile = fontfile.replace("\\", "/")
-            fontfile_escaped = fontfile.replace(":", "\\:")   # 关键：转义盘符冒号
-        else:
-            fontfile_escaped = None
+        fontfile = fontfile.replace("\\", "/")
+        fontfile_escaped = fontfile.replace(":", "\\:")
 
-        # 文本转义
         safe_text = self._escape(text)
 
-        # 构建滤镜
+        if rect and fontsize <= 0:
+            fontsize, draw_x, draw_y = self._calc_adaptive_params(
+                safe_text, rect, fontfile
+            )
+        else:
+            draw_x = x
+            draw_y = y
+            if fontsize <= 0:
+                fontsize = 24
+
         filters = []
         if remove_first and remove_rect:
             rx, ry, rw, rh = remove_rect
@@ -49,21 +92,19 @@ class WatermarkAdder(QObject):
 
         drawtext = (
             f"drawtext=text='{safe_text}':"
-            f"x={x}:y={y}:"
+            f"x={draw_x}:y={draw_y}:"
             f"fontsize={fontsize}:"
             f"fontcolor={fontcolor}@{alpha}"
         )
         if fontfile_escaped:
             drawtext += f":fontfile='{fontfile_escaped}'"
-        # 如果 FFmpeg 升级后支持 angle，可恢复下面这行
-        # drawtext += f":angle={angle}"
 
         filters.append(drawtext)
         vf = ",".join(filters)
 
         segment_time = 30.0
         total_segments = max(1, int(duration / segment_time) + (1 if duration % segment_time else 0))
-        temp_dir = tempfile.mkdtemp(prefix="addtext_")
+        temp_dir = tempfile.mkdtemp(prefix="addtext_", dir="temp")
         segment_files = []
 
         try:
@@ -98,15 +139,13 @@ class WatermarkAdder(QObject):
                 segment_end = min((i + 1) * segment_time, duration)
                 self.progress_updated.emit(int((segment_end / duration) * 100))
 
-            # ---------- 合并（优先使用流复制，失败则快速重编码） ----------
-            self.status_updated.emit("正在快速合并...")
+            self.status_updated.emit("正在合并...")
             concat_file = os.path.join(temp_dir, "concat.txt")
             with open(concat_file, "w", encoding="utf-8") as f:
                 for seg in segment_files:
                     safe_path = seg.replace("\\", "/")
                     f.write(f"file '{safe_path}'\n")
 
-            # 方案1：尝试无编码复制（极快）
             merge_cmd_copy = [
                 "ffmpeg", "-y",
                 "-f", "concat", "-safe", "0",
@@ -116,25 +155,20 @@ class WatermarkAdder(QObject):
             ]
             result = subprocess.run(merge_cmd_copy, capture_output=True, text=True, encoding="utf-8", errors="ignore")
 
-            if result.returncode == 0 and os.path.exists(output_path):
-                self.progress_updated.emit(100)
-                self.finished.emit(True, output_path)
-                return
-
-            # 方案2：快速重编码（合并保底，速度优化）
-            self.status_updated.emit("快速重编码合并中...")
-            merge_cmd_encode = [
-                "ffmpeg", "-y",
-                "-f", "concat", "-safe", "0",
-                "-i", concat_file,
-                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
-                "-c:a", "aac", "-b:a", "128k",
-                output_path
-            ]
-            result2 = subprocess.run(merge_cmd_encode, capture_output=True, text=True, encoding="utf-8", errors="ignore")
-            if result2.returncode != 0 or not os.path.exists(output_path):
-                error_details = result2.stderr.strip() or result2.stdout.strip()
-                raise RuntimeError(f"合并失败：{error_details}")
+            if result.returncode != 0 or not os.path.exists(output_path):
+                self.status_updated.emit("快速合并失败，使用重编码合并...")
+                merge_cmd_encode = [
+                    "ffmpeg", "-y",
+                    "-f", "concat", "-safe", "0",
+                    "-i", concat_file,
+                    "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
+                    "-c:a", "aac", "-b:a", "128k",
+                    output_path
+                ]
+                result2 = subprocess.run(merge_cmd_encode, capture_output=True, text=True, encoding="utf-8", errors="ignore")
+                if result2.returncode != 0 or not os.path.exists(output_path):
+                    error_details = result2.stderr.strip() or result2.stdout.strip()
+                    raise RuntimeError(f"合并失败：{error_details}")
 
             self.progress_updated.emit(100)
             self.finished.emit(True, output_path)
