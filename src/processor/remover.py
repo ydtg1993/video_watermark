@@ -1,12 +1,9 @@
-# src/processor/remover.py
+import os
+import tempfile
 import subprocess
 import re
-import json
-import os
-import math
-import tempfile
-import shutil
 from PySide6.QtCore import QObject, Signal
+from src.core.utils import get_video_duration, normalize_rect
 
 
 class WatermarkRemover(QObject):
@@ -14,148 +11,139 @@ class WatermarkRemover(QObject):
     status_updated = Signal(str)
     finished = Signal(bool, str)
 
-    def remove(self, input_path: str, output_path: str,
-               x: int, y: int, width: int, height: int,
-               encoder: str = "libx264", quality: str = "标准"):
-        duration = self._get_duration(input_path)
+    def __init__(self):
+        super().__init__()
+        self._cancelled = False
+
+    def cancel(self):
+        self._cancelled = True
+
+    def remove(self, input_path, output_path, x, y, width, height, encoder='nvenc', quality='标准'):
+        duration = get_video_duration(input_path)
         if duration is None:
-            self.finished.emit(False, "无法读取视频时长，请检查文件。")
+            self.finished.emit(False, "无法读取视频时长")
             return
 
-        segment_duration = 30.0
-        num_segments = max(1, math.ceil(duration / segment_duration))
-        temp_dir = tempfile.mkdtemp(prefix="remover_")
+        x, y, width, height = normalize_rect(x, y, width, height)
+        segment_time = 30.0
+        total_segments = max(1, int(duration / segment_time) + (1 if duration % segment_time else 0))
+
+        temp_dir = tempfile.mkdtemp(prefix="delogo_")
         segment_files = []
 
         try:
-            for i in range(num_segments):
-                start_time = i * segment_duration
-                seg_file = os.path.join(temp_dir, f"seg_{i:04d}.mp4")
-
-                self.status_updated.emit(f"正在处理片段 {i + 1}/{num_segments} ...")
-                vf = f"delogo=x={x}:y={y}:w={width}:h={height}:show=0"
-                cmd = [
-                    "ffmpeg",
-                    "-ss", str(start_time),
-                    "-i", input_path,
-                    "-t", str(segment_duration),
-                    "-vf", vf,
-                ]
-                enc_params = self._build_encoder_params(encoder, quality)
-                cmd.extend(enc_params)
-                cmd.extend(["-y", seg_file])
-
-                try:
-                    process = subprocess.Popen(
-                        cmd,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE,
-                        text=True,
-                        bufsize=1,
-                        universal_newlines=True
-                    )
-                except FileNotFoundError:
-                    self.finished.emit(False, "未找到 FFmpeg，请确认已安装并配置到环境变量。")
+            for i in range(total_segments):
+                if self._cancelled:
+                    self.finished.emit(False, "已取消")
                     return
 
-                # 解析进度并收集 stderr 内容
-                stderr_lines = []
-                time_pattern = re.compile(r"time=(\d{2}):(\d{2}):(\d{2})\.(\d{2})")
-                for line in process.stderr:
-                    stderr_lines.append(line)
-                    match = time_pattern.search(line)
-                    if match:
-                        h, m, s, cs = match.groups()
-                        current_sec = int(h) * 3600 + int(m) * 60 + int(s) + int(cs) / 100
-                        absolute_sec = start_time + current_sec
-                        percent = min(100, int((absolute_sec / duration) * 100))
-                        self.progress_updated.emit(percent)
+                start = i * segment_time
+                seg_file = os.path.join(temp_dir, f"seg_{i:04d}.mp4")
+                self.status_updated.emit(f"处理片段 {i+1}/{total_segments} ...")
 
-                process.wait()
-                if process.returncode != 0 or not os.path.exists(seg_file):
-                    error_detail = "\n".join(stderr_lines[-5:])  # 最后5行通常包含出错信息
-                    raise RuntimeError(f"片段{i + 1}处理失败，FFmpeg错误:\n{error_detail}")
+                vf = f"delogo=x={x}:y={y}:w={width}:h={height}:show=0"
+                cmd = [
+                    "ffmpeg", "-y",
+                    "-ss", str(start),
+                    "-i", input_path,
+                    "-t", str(segment_time),
+                    "-vf", vf,
+                    "-c:a", "copy",
+                    *self._encoder_params(encoder, quality),
+                    "-progress", "pipe:1",
+                    "-nostats",
+                    seg_file
+                ]
+
+                success, error_info = self._run_segment_with_progress(cmd, duration, start)
+                if not success:
+                    self.finished.emit(False, f"片段 {i+1} 处理失败\n{error_info}")
+                    return
 
                 segment_files.append(seg_file)
-                final_sec = min((i + 1) * segment_duration, duration)
-                self.progress_updated.emit(min(100, int((final_sec / duration) * 100)))
+                segment_end = min((i + 1) * segment_time, duration)
+                overall_percent = int((segment_end / duration) * 100)
+                self.progress_updated.emit(min(overall_percent, 100))
 
-            # 合并
-            self.status_updated.emit("正在合并片段...")
-            concat_file = os.path.join(temp_dir, "files.txt")
+            # 合并片段
+            self.status_updated.emit("合并片段中...")
+            concat_file = os.path.join(temp_dir, "concat.txt")
             with open(concat_file, "w", encoding="utf-8") as f:
                 for seg in segment_files:
-                    f.write(f"file '{seg}'\n")
+                    # 强制使用正斜杠，避免 FFmpeg 路径解析错误
+                    safe_path = seg.replace("\\", "/")
+                    f.write(f"file '{safe_path}'\n")
 
             merge_cmd = [
-                "ffmpeg",
-                "-f", "concat",
-                "-safe", "0",
+                "ffmpeg", "-y",
+                "-f", "concat", "-safe", "0",
                 "-i", concat_file,
-                "-c", "copy",
-                "-y",
+                "-c:v", "libx264", "-crf", "23", "-preset", "fast",
+                "-c:a", "aac", "-b:a", "128k",
                 output_path
             ]
-            result = subprocess.run(merge_cmd, capture_output=True, text=True)
-            if result.returncode != 0 or not os.path.exists(output_path):
-                raise RuntimeError(f"合并失败:\n{result.stderr.strip()}")
+            result = subprocess.run(merge_cmd, capture_output=True, text=True, encoding="utf-8", errors="ignore")
+            if result.returncode != 0:
+                error_details = result.stderr.strip() or result.stdout.strip()
+                raise RuntimeError(f"合并失败，FFmpeg 输出：\n{error_details}")
 
-            self.finished.emit(True, output_path)
+            if os.path.exists(output_path):
+                self.progress_updated.emit(100)
+                self.finished.emit(True, output_path)
+            else:
+                self.finished.emit(False, "合并失败：输出文件未生成")
 
         except Exception as e:
             self.finished.emit(False, str(e))
         finally:
+            import shutil
             shutil.rmtree(temp_dir, ignore_errors=True)
 
-    def _build_encoder_params(self, encoder: str, quality: str):
-        """根据编码器和质量返回对应的编码器参数列表"""
-        # 基础：视频编码器、音频编码
-        if encoder == "nvenc":
-            vcodec = "h264_nvenc"
-            # NVENC 质量控制使用 -cq (0-51)，无损需添加 -coder lossless
-            if quality == "无损":
-                return ["-c:v", vcodec, "-cq", "0", "-coder", "lossless", "-c:a", "aac", "-b:a", "128k"]
-            elif quality == "高质量":
-                return ["-c:v", vcodec, "-cq", "18", "-c:a", "aac", "-b:a", "128k"]
-            else:  # 标准
-                return ["-c:v", vcodec, "-cq", "23", "-c:a", "aac", "-b:a", "128k"]
-        elif encoder == "qsv":
-            vcodec = "h264_qsv"
-            # QSV 质量用 -global_quality (0-51)
-            if quality == "无损":
-                return ["-c:v", vcodec, "-global_quality", "0", "-c:a", "aac", "-b:a", "128k"]
-            elif quality == "高质量":
-                return ["-c:v", vcodec, "-global_quality", "18", "-c:a", "aac", "-b:a", "128k"]
-            else:
-                return ["-c:v", vcodec, "-global_quality", "23", "-c:a", "aac", "-b:a", "128k"]
-        elif encoder == "amf":
-            vcodec = "h264_amf"
-            # AMF 质量用 -qp_p / -qp_i 等，简化处理
-            if quality == "无损":
-                return ["-c:v", vcodec, "-qp_i", "0", "-qp_p", "0", "-c:a", "aac", "-b:a", "128k"]
-            elif quality == "高质量":
-                return ["-c:v", vcodec, "-qp_i", "18", "-qp_p", "18", "-c:a", "aac", "-b:a", "128k"]
-            else:
-                return ["-c:v", vcodec, "-qp_i", "23", "-qp_p", "23", "-c:a", "aac", "-b:a", "128k"]
-        else:  # 默认 libx264
-            if quality == "无损":
-                return ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "0", "-c:a", "aac", "-b:a", "128k"]
-            elif quality == "高质量":
-                return ["-c:v", "libx264", "-preset", "slow", "-crf", "18", "-c:a", "aac", "-b:a", "128k"]
-            else:
-                return ["-c:v", "libx264", "-preset", "medium", "-crf", "23", "-c:a", "aac", "-b:a", "128k"]
+    def _run_segment_with_progress(self, cmd, total_duration, segment_start):
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                   text=True, encoding="utf-8", errors="ignore")
+        time_pattern = re.compile(r"out_time_ms=(\d+)")
+        output_lines = []
 
-    @staticmethod
-    def _get_duration(filepath: str) -> float | None:
-        cmd = [
-            "ffprobe", "-v", "error",
-            "-show_entries", "format=duration",
-            "-of", "json",
-            filepath
-        ]
-        try:
-            result = subprocess.run(cmd, capture_output=True, text=True)
-            data = json.loads(result.stdout)
-            return float(data["format"]["duration"])
-        except Exception:
-            return None
+        while True:
+            if self._cancelled:
+                process.terminate()
+                return False, "任务已取消"
+
+            line = process.stdout.readline()
+            if not line:
+                if process.poll() is not None:
+                    break
+                continue
+
+            output_lines.append(line.strip())
+            if len(output_lines) > 20:
+                output_lines.pop(0)
+
+            match = time_pattern.search(line)
+            if match and total_duration > 0:
+                ms = int(match.group(1))
+                current_sec = segment_start + ms / 1_000_000
+                percent = int((current_sec / total_duration) * 100)
+                self.progress_updated.emit(min(percent, 100))
+
+        ret = process.wait()
+        if ret != 0:
+            error_info = "\n".join(output_lines[-10:])
+            return False, f"FFmpeg 退出码 {ret}\n{error_info}"
+        return True, None
+
+    def _encoder_params(self, encoder, quality):
+        if encoder == "nvenc":
+            return ["-c:v", "h264_nvenc", "-preset", "p5", "-rc", "vbr", "-cq", "19",
+                    "-b:v", "8M", "-maxrate", "12M", "-bufsize", "16M", "-pix_fmt", "yuv420p"]
+        elif encoder == "qsv":
+            return ["-c:v", "h264_qsv", "-global_quality", "18"]
+        elif encoder == "amf":
+            return ["-c:v", "h264_amf", "-qp_i", "18", "-qp_p", "18"]
+        elif quality == "无损":
+            return ["-c:v", "libx264", "-crf", "0", "-preset", "slow"]
+        elif quality == "高质量":
+            return ["-c:v", "libx264", "-crf", "18", "-preset", "slow"]
+        else:
+            return ["-c:v", "libx264", "-crf", "23", "-preset", "medium"]

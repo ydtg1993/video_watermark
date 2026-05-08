@@ -1,12 +1,9 @@
-# src/processor/watermark_adder.py
+import os
+import tempfile
 import subprocess
 import re
-import json
-import os
-import math
-import tempfile
-import shutil
 from PySide6.QtCore import QObject, Signal
+from src.core.utils import get_video_duration, get_default_font
 
 
 class WatermarkAdder(QObject):
@@ -14,269 +11,199 @@ class WatermarkAdder(QObject):
     status_updated = Signal(str)
     finished = Signal(bool, str)
 
-    def add_text(self, input_path: str, output_path: str,
-                 text: str, x: int, y: int, fontfile: str = "",
-                 fontsize: int = 24, fontcolor: str = "white",
-                 alpha: float = 1.0, bold: bool = False,
-                 italic: bool = False, angle: float = 0.0,
-                 encoder: str = "libx264", quality: str = "标准",
-                 remove_first: bool = False, remove_rect: tuple = None):
+    def __init__(self):
+        super().__init__()
+        self._cancelled = False
 
-        # 安全转义文本
-        safe_text = self._escape_drawtext(text)
-        fontcolor_hex = self._color_to_hex(fontcolor)
+    def cancel(self):
+        self._cancelled = True
 
-        # 构建 drawtext 滤镜 (文本用单引号包裹)
-        drawtext_vf = (
+    def add_text(self, input_path, output_path, text, x, y, fontfile='',
+                 fontsize=24, fontcolor='white', alpha=1.0, angle=0,
+                 encoder='libx264', quality='标准',
+                 remove_first=False, remove_rect=None):
+        duration = get_video_duration(input_path)
+        if duration is None:
+            self.finished.emit(False, "无法读取视频时长")
+            return
+
+        # 字体回退
+        if not fontfile:
+            fontfile = get_default_font()
+
+        if fontfile:
+            # 路径处理：转义冒号，使用正斜杠，最后用单引号包裹
+            fontfile = fontfile.replace("\\", "/")
+            fontfile_escaped = fontfile.replace(":", "\\:")   # 关键：转义盘符冒号
+        else:
+            fontfile_escaped = None
+
+        # 文本转义
+        safe_text = self._escape(text)
+
+        # 构建滤镜
+        filters = []
+        if remove_first and remove_rect:
+            rx, ry, rw, rh = remove_rect
+            filters.append(f"delogo=x={rx}:y={ry}:w={rw}:h={rh}:show=0")
+
+        drawtext = (
             f"drawtext=text='{safe_text}':"
             f"x={x}:y={y}:"
-            f"fontsize={fontsize}:fontcolor={fontcolor_hex}@"
-            f"{alpha}:angle={angle}"
+            f"fontsize={fontsize}:"
+            f"fontcolor={fontcolor}@{alpha}"
         )
+        if fontfile_escaped:
+            drawtext += f":fontfile='{fontfile_escaped}'"
+        # 如果 FFmpeg 升级后支持 angle，可恢复下面这行
+        # drawtext += f":angle={angle}"
 
-        # 如果同时要求先去水印
-        if remove_first and remove_rect:
-            rx, ry, rw, rh = remove_rect
-            delogo_vf = f"delogo=x={rx}:y={ry}:w={rw}:h={rh}:show=0"
-            combined_vf = f"{delogo_vf},{drawtext_vf}"
-        else:
-            combined_vf = drawtext_vf
+        filters.append(drawtext)
+        vf = ",".join(filters)
 
-        self._process_segmented(input_path, output_path, combined_vf,
-                                encoder, quality)
-
-    @staticmethod
-    def _escape_drawtext(text: str) -> str:
-        """
-        对 drawtext 滤镜中 text= 的值进行 FFmpeg 要求的转义。
-        顺序很重要：先转义反斜杠，再转义冒号、单引号、逗号。
-        """
-        # 1. 反斜杠
-        text = text.replace('\\', '\\\\')
-        # 2. 冒号
-        text = text.replace(':', '\\:')
-        # 3. 单引号 (因为我们用单引号包裹文本)
-        text = text.replace("'", "\\'")
-        # 4. 逗号 (如果文本要和其他滤镜用逗号连接，则必须转义)
-        text = text.replace(',', '\\,')
-        return text
-
-    def add_image(self, input_path: str, output_path: str,
-                  image_path: str, x: int, y: int,
-                  width: int = 0, height: int = 0,
-                  alpha: float = 1.0,
-                  encoder: str = "libx264", quality: str = "标准",
-                  remove_first: bool = False, remove_rect: tuple = None):
-        if width > 0 and height > 0:
-            scale_filter = f"[1:v]scale={width}:{height}[wm];"
-            overlay_filter = f"[0:v][wm]overlay={x}:{y}:alpha={alpha}"
-        else:
-            scale_filter = ""
-            overlay_filter = f"[0:v][1:v]overlay={x}:{y}:alpha={alpha}"
-
-        if remove_first and remove_rect:
-            rx, ry, rw, rh = remove_rect
-            delogo_filter = f"[0:v]delogo=x={rx}:y={ry}:w={rw}:h={rh}:show=0[base];"
-            if scale_filter:
-                overlay_part = f"[base][wm]overlay={x}:{y}:alpha={alpha}"
-                filter_complex = f"{delogo_filter}{scale_filter}{overlay_part}"
-            else:
-                overlay_part = f"[base][1:v]overlay={x}:{y}:alpha={alpha}"
-                filter_complex = f"{delogo_filter}{overlay_part}"
-        else:
-            filter_complex = f"{scale_filter}{overlay_filter}"
-
-        self._process_segmented_with_image(input_path, output_path,
-                                           image_path, filter_complex,
-                                           encoder, quality)
-
-    def _process_segmented(self, input_path, output_path, vf,
-                           encoder, quality):
-        # 去掉 remove_first 和 remove_rect 参数，因为 vf 已经是完整的滤镜链
-        duration = self._get_duration(input_path)
-        if duration is None:
-            self.finished.emit(False, "无法读取视频时长。")
-            return
-
-        segment_duration = 30.0
-        num_segments = max(1, math.ceil(duration / segment_duration))
-        temp_dir = tempfile.mkdtemp(prefix="adder_")
+        segment_time = 30.0
+        total_segments = max(1, int(duration / segment_time) + (1 if duration % segment_time else 0))
+        temp_dir = tempfile.mkdtemp(prefix="addtext_")
         segment_files = []
 
         try:
-            for i in range(num_segments):
-                start_time = i * segment_duration
+            for i in range(total_segments):
+                if self._cancelled:
+                    self.finished.emit(False, "已取消")
+                    return
+
+                start = i * segment_time
                 seg_file = os.path.join(temp_dir, f"seg_{i:04d}.mp4")
+                self.status_updated.emit(f"处理片段 {i+1}/{total_segments} ...")
 
-                self.status_updated.emit(f"正在处理片段 {i + 1}/{num_segments} ...")
                 cmd = [
-                    "ffmpeg",
-                    "-ss", str(start_time),
+                    "ffmpeg", "-y",
+                    "-ss", str(start),
                     "-i", input_path,
-                    "-t", str(segment_duration),
-                    "-vf", vf,  # ← 直接使用传入的完整 vf
+                    "-t", str(segment_time),
+                    "-vf", vf,
+                    "-c:a", "copy",
+                    *self._encoder_params(encoder, quality),
+                    "-progress", "pipe:1",
+                    "-nostats",
+                    seg_file
                 ]
-                cmd.extend(self._build_encoder_params(encoder, quality))
-                cmd.extend(["-y", seg_file])
 
-                self._run_segment_cmd(cmd, start_time, duration, seg_file)
+                success, error_info = self._run_segment_with_progress(cmd, duration, start)
+                if not success:
+                    self.finished.emit(False, f"片段 {i+1} 处理失败\n{error_info}")
+                    return
+
                 segment_files.append(seg_file)
+                segment_end = min((i + 1) * segment_time, duration)
+                self.progress_updated.emit(int((segment_end / duration) * 100))
 
-            self._merge_segments(temp_dir, segment_files, output_path)
+            # ---------- 合并（优先使用流复制，失败则快速重编码） ----------
+            self.status_updated.emit("正在快速合并...")
+            concat_file = os.path.join(temp_dir, "concat.txt")
+            with open(concat_file, "w", encoding="utf-8") as f:
+                for seg in segment_files:
+                    safe_path = seg.replace("\\", "/")
+                    f.write(f"file '{safe_path}'\n")
 
-        except Exception as e:
-            self.finished.emit(False, str(e))
-        finally:
-            shutil.rmtree(temp_dir, ignore_errors=True)
+            # 方案1：尝试无编码复制（极快）
+            merge_cmd_copy = [
+                "ffmpeg", "-y",
+                "-f", "concat", "-safe", "0",
+                "-i", concat_file,
+                "-c", "copy",
+                output_path
+            ]
+            result = subprocess.run(merge_cmd_copy, capture_output=True, text=True, encoding="utf-8", errors="ignore")
 
-    def _process_segmented_with_image(self, input_path, output_path,
-                                      image_path, filter_complex,
-                                      encoder, quality):
-        duration = self._get_duration(input_path)
-        if duration is None:
-            self.finished.emit(False, "无法读取视频时长。")
-            return
+            if result.returncode == 0 and os.path.exists(output_path):
+                self.progress_updated.emit(100)
+                self.finished.emit(True, output_path)
+                return
 
-        segment_duration = 30.0
-        num_segments = max(1, math.ceil(duration / segment_duration))
-        temp_dir = tempfile.mkdtemp(prefix="adder_img_")
-        segment_files = []
+            # 方案2：快速重编码（合并保底，速度优化）
+            self.status_updated.emit("快速重编码合并中...")
+            merge_cmd_encode = [
+                "ffmpeg", "-y",
+                "-f", "concat", "-safe", "0",
+                "-i", concat_file,
+                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
+                "-c:a", "aac", "-b:a", "128k",
+                output_path
+            ]
+            result2 = subprocess.run(merge_cmd_encode, capture_output=True, text=True, encoding="utf-8", errors="ignore")
+            if result2.returncode != 0 or not os.path.exists(output_path):
+                error_details = result2.stderr.strip() or result2.stdout.strip()
+                raise RuntimeError(f"合并失败：{error_details}")
 
-        try:
-            for i in range(num_segments):
-                start_time = i * segment_duration
-                seg_file = os.path.join(temp_dir, f"seg_{i:04d}.mp4")
-
-                self.status_updated.emit(f"正在处理片段 {i+1}/{num_segments} ...")
-                cmd = [
-                    "ffmpeg",
-                    "-ss", str(start_time),
-                    "-i", input_path,
-                    "-i", image_path,
-                    "-t", str(segment_duration),
-                    "-filter_complex", filter_complex,
-                ]
-                cmd.extend(self._build_encoder_params(encoder, quality))
-                cmd.extend(["-y", seg_file])
-
-                self._run_segment_cmd(cmd, start_time, duration, seg_file)
-                segment_files.append(seg_file)
-
-            self._merge_segments(temp_dir, segment_files, output_path)
-
-        except Exception as e:
-            self.finished.emit(False, str(e))
-        finally:
-            shutil.rmtree(temp_dir, ignore_errors=True)
-
-    def _run_segment_cmd(self, cmd, start_time, total_duration, seg_file):
-        try:
-            print("DEBUG CMD:", " ".join(cmd))
-            process = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                text=True, bufsize=1, universal_newlines=True
-            )
-        except FileNotFoundError:
-            self.finished.emit(False, "未找到 FFmpeg，请确认已安装。")
-            raise RuntimeError("FFmpeg not found")
-
-        stderr_lines = []
-        time_pattern = re.compile(r"time=(\d{2}):(\d{2}):(\d{2})\.(\d{2})")
-        for line in process.stderr:
-            stderr_lines.append(line)
-            match = time_pattern.search(line)
-            if match:
-                h, m, s, cs = match.groups()
-                current_sec = int(h) * 3600 + int(m) * 60 + int(s) + int(cs) / 100
-                absolute_sec = start_time + current_sec
-                percent = min(100, int((absolute_sec / total_duration) * 100))
-                self.progress_updated.emit(percent)
-
-        process.wait()
-        if process.returncode != 0 or not os.path.exists(seg_file):
-            raise RuntimeError("片段处理失败，FFmpeg错误:\n" + "\n".join(stderr_lines[-5:]))
-
-        final_sec = min(start_time + 30, total_duration)
-        self.progress_updated.emit(min(100, int((final_sec / total_duration) * 100)))
-
-    def _merge_segments(self, temp_dir, segment_files, output_path):
-        self.status_updated.emit("正在合并片段...")
-        concat_file = os.path.join(temp_dir, "files.txt")
-        with open(concat_file, "w", encoding="utf-8") as f:
-            for seg in segment_files:
-                f.write(f"file '{seg}'\n")
-
-        merge_cmd = [
-            "ffmpeg",
-            "-f", "concat",
-            "-safe", "0",
-            "-i", concat_file,
-            "-c", "copy",
-            "-y",
-            output_path
-        ]
-        subprocess.run(merge_cmd, check=True, capture_output=True, text=True)
-
-        if os.path.exists(output_path):
+            self.progress_updated.emit(100)
             self.finished.emit(True, output_path)
-        else:
-            raise RuntimeError("合并失败，输出文件未生成")
 
-    def _build_encoder_params(self, encoder: str, quality: str):
+        except Exception as e:
+            self.finished.emit(False, str(e))
+        finally:
+            import shutil
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def _run_segment_with_progress(self, cmd, total_duration, segment_start):
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                   text=True, encoding="utf-8", errors="ignore")
+        time_pattern = re.compile(r"out_time_ms=(\d+)")
+        output_lines = []
+
+        while True:
+            if self._cancelled:
+                process.terminate()
+                return False, "任务已取消"
+
+            line = process.stdout.readline()
+            if not line:
+                if process.poll() is not None:
+                    break
+                continue
+
+            output_lines.append(line.strip())
+            if len(output_lines) > 20:
+                output_lines.pop(0)
+
+            match = time_pattern.search(line)
+            if match and total_duration > 0:
+                ms = int(match.group(1))
+                current_sec = segment_start + ms / 1_000_000
+                percent = int((current_sec / total_duration) * 100)
+                self.progress_updated.emit(min(percent, 100))
+
+        ret = process.wait()
+        if ret != 0:
+            error_info = "\n".join(output_lines[-10:])
+            return False, f"FFmpeg 退出码 {ret}\n{error_info}"
+        return True, None
+
+    def _escape(self, text: str) -> str:
+        return (text.replace("\\", "\\\\")
+                     .replace(":", "\\:")
+                     .replace("'", "\\'")
+                     .replace(",", "\\,")
+                     .replace("%", "\\%"))
+
+    def _encoder_params(self, encoder, quality):
         if encoder == "nvenc":
-            vcodec = "h264_nvenc"
-            if quality == "无损":
-                return ["-c:v", vcodec, "-cq", "0", "-coder", "lossless", "-c:a", "aac", "-b:a", "128k"]
-            elif quality == "高质量":
-                return ["-c:v", vcodec, "-cq", "18", "-c:a", "aac", "-b:a", "128k"]
-            else:
-                return ["-c:v", vcodec, "-cq", "23", "-c:a", "aac", "-b:a", "128k"]
+            return ["-c:v", "h264_nvenc", "-preset", "p5", "-rc", "vbr", "-cq", "19",
+                    "-b:v", "8M", "-maxrate", "12M", "-bufsize", "16M", "-pix_fmt", "yuv420p"]
         elif encoder == "qsv":
-            vcodec = "h264_qsv"
-            if quality == "无损":
-                return ["-c:v", vcodec, "-global_quality", "0", "-c:a", "aac", "-b:a", "128k"]
-            elif quality == "高质量":
-                return ["-c:v", vcodec, "-global_quality", "18", "-c:a", "aac", "-b:a", "128k"]
-            else:
-                return ["-c:v", vcodec, "-global_quality", "23", "-c:a", "aac", "-b:a", "128k"]
+            return ["-c:v", "h264_qsv", "-global_quality", "18"]
         elif encoder == "amf":
-            vcodec = "h264_amf"
-            if quality == "无损":
-                return ["-c:v", vcodec, "-qp_i", "0", "-qp_p", "0", "-c:a", "aac", "-b:a", "128k"]
-            elif quality == "高质量":
-                return ["-c:v", vcodec, "-qp_i", "18", "-qp_p", "18", "-c:a", "aac", "-b:a", "128k"]
-            else:
-                return ["-c:v", vcodec, "-qp_i", "23", "-qp_p", "23", "-c:a", "aac", "-b:a", "128k"]
+            return ["-c:v", "h264_amf", "-qp_i", "18", "-qp_p", "18"]
+        elif quality == "无损":
+            return ["-c:v", "libx264", "-crf", "0", "-preset", "slow"]
+        elif quality == "高质量":
+            return ["-c:v", "libx264", "-crf", "18", "-preset", "slow"]
         else:
-            if quality == "无损":
-                return ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "0", "-c:a", "aac", "-b:a", "128k"]
-            elif quality == "高质量":
-                return ["-c:v", "libx264", "-preset", "slow", "-crf", "18", "-c:a", "aac", "-b:a", "128k"]
-            else:
-                return ["-c:v", "libx264", "-preset", "medium", "-crf", "23", "-c:a", "aac", "-b:a", "128k"]
+            return ["-c:v", "libx264", "-crf", "23", "-preset", "medium"]
 
-    @staticmethod
-    def _get_duration(filepath: str) -> float | None:
-        cmd = [
-            "ffprobe", "-v", "error",
-            "-show_entries", "format=duration",
-            "-of", "json",
-            filepath
-        ]
-        try:
-            result = subprocess.run(cmd, capture_output=True, text=True)
-            data = json.loads(result.stdout)
-            return float(data["format"]["duration"])
-        except Exception:
-            return None
-
-    @staticmethod
-    def _color_to_hex(color: str) -> str:
-        if color.startswith('#'):
-            return color
-        color_map = {
-            "white": "#FFFFFF", "black": "#000000", "red": "#FF0000",
-            "green": "#00FF00", "blue": "#0000FF", "yellow": "#FFFF00",
-            "cyan": "#00FFFF", "magenta": "#FF00FF", "gray": "#808080"
-        }
-        return color_map.get(color.lower(), "#FFFFFF")
+    def add_image(self, input_path, output_path, image_path, x, y,
+                  width=0, height=0, alpha=1.0,
+                  encoder='libx264', quality='标准',
+                  remove_first=False, remove_rect=None):
+        """图片水印暂未实现"""
+        self.finished.emit(False, "图片水印功能暂未实现")

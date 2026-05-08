@@ -1,166 +1,350 @@
-# src/gui/video_player.py
+from PySide6.QtCore import (
+    Qt,
+    QRect,
+    QPoint,
+    Signal
+)
+
+from PySide6.QtWidgets import QWidget, QApplication
+from PySide6.QtGui import (
+    QColor,
+    QPainter,
+    QPen,
+    QPixmap,
+    QImage,
+    QBrush
+)
+
 import cv2
-from PySide6.QtCore import Qt, Signal, QRect, QPoint
-from PySide6.QtGui import QImage, QPixmap, QPainter, QPen, QColor
-from PySide6.QtWidgets import QLabel, QRubberBand
 
-class VideoPlayer(QLabel):
-    area_selected = Signal(int, int, int, int)  # x, y, w, h
 
-    def __init__(self):
-        super().__init__()
-        self._pending_video_rect = None
-        self.setAlignment(Qt.AlignCenter)
+class VideoPlayer(QWidget):
+    area_selected = Signal(int, int, int, int)
+
+    HANDLE_SIZE = 8
+    MIN_SIZE = 10
+
+    SNAP_DIST = 12   # ✔ 吸附距离
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+
         self.setMouseTracking(True)
-        self.setStyleSheet("background-color: black;")
-        self._source_frame = None
-        self._selection = QRect()          # 当前选择矩形（屏幕坐标）
-        self._selecting = False            # 是否正在框选新区域
-        self._moving = False               # 是否正在移动现有矩形
+
+        self._frame = None
+        self._pixmap = None
+
+        self._video_rect = QRect()
+
+        self._selection_video = QRect()
+
+        # 状态
+        self._dragging = False
+        self._moving = False
+        self._resizing = False
+        self._resize_handle = None
+
         self._origin = QPoint()
         self._drag_offset = QPoint()
 
-        self.rubber_band = QRubberBand(QRubberBand.Rectangle, self)
-        self.rubber_band.hide()
+        # ✔ 多选框（预留）
+        self._selections = []
 
-    def set_frame(self, frame_bgr):
-        self._source_frame = frame_bgr.copy()
-        self._display_frame()
-        if hasattr(self, '_pending_video_rect') and self._pending_video_rect:
-            self.set_selection_by_video_coords(*self._pending_video_rect)
-            self._pending_video_rect = None
+    # =========================
+    # Frame
+    # =========================
 
-    def _display_frame(self):
-        if self._source_frame is None:
-            return
-        rgb = cv2.cvtColor(self._source_frame, cv2.COLOR_BGR2RGB)
+    def set_frame(self, frame):
+        self._frame = frame
+
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
         h, w, ch = rgb.shape
         bytes_per_line = ch * w
-        qt_img = QImage(rgb.data, w, h, bytes_per_line, QImage.Format_RGB888)
-        self.setPixmap(QPixmap.fromImage(qt_img).scaled(
-            self.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
-        ))
 
-    def mousePressEvent(self, event):
-        if event.button() != Qt.LeftButton or self.pixmap() is None:
-            return
-        pos = event.position().toPoint()
+        image = QImage(
+            rgb.data,
+            w,
+            h,
+            bytes_per_line,
+            QImage.Format_RGB888
+        )
 
-        # 1. 如果点击在已有矩形内部 → 开始移动模式
-        if self._selection.isValid() and self._selection.contains(pos):
-            self._moving = True
-            self._drag_offset = pos - self._selection.topLeft()
-            self.setCursor(Qt.ClosedHandCursor)
-            return
+        self._pixmap = QPixmap.fromImage(image)
+        self.update()
 
-        # 2. 否则开始新框选
-        self._origin = pos
-        self._selecting = True
-        self.rubber_band.setGeometry(QRect(self._origin, self._origin))
-        self.rubber_band.show()
-
-    def mouseMoveEvent(self, event):
-        pos = event.position().toPoint()
-
-        if self._selecting:
-            self.rubber_band.setGeometry(
-                QRect(self._origin, pos).normalized()
-            )
-        elif self._moving:
-            # 计算新位置并限制在 label 范围内
-            new_top_left = pos - self._drag_offset
-            new_rect = QRect(new_top_left, self._selection.size())
-            # 限制边界
-            max_x = self.width() - new_rect.width()
-            max_y = self.height() - new_rect.height()
-            if new_rect.left() < 0:
-                new_rect.moveLeft(0)
-            elif new_rect.left() > max_x:
-                new_rect.moveLeft(max_x)
-            if new_rect.top() < 0:
-                new_rect.moveTop(0)
-            elif new_rect.top() > max_y:
-                new_rect.moveTop(max_y)
-            self._selection = new_rect
-            self.update()  # 重绘绿色矩形
-
-    def mouseReleaseEvent(self, event):
-        if event.button() != Qt.LeftButton:
-            return
-
-        if self._selecting:
-            self._selecting = False
-            self.rubber_band.hide()
-            rect = QRect(self._origin, event.position().toPoint()).normalized()
-            if rect.width() > 5 and rect.height() > 5:
-                self._selection = rect
-                self._emit_area_from_rect(rect)
-            self.update()
-
-        elif self._moving:
-            self._moving = False
-            self.setCursor(Qt.ArrowCursor)
-            # 移动结束，发送新坐标
-            self._emit_area_from_rect(self._selection)
-            self.update()
-
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        if self._source_frame is not None:
-            self._display_frame()
-            self.update()
+    # =========================
+    # Paint
+    # =========================
 
     def paintEvent(self, event):
-        super().paintEvent(event)
-        if not self._selection.isNull() and self._source_frame is not None:
-            painter = QPainter(self)
-            painter.setPen(QPen(QColor(0, 255, 0), 2))
-            # 当正在框选时，rubber_band 已经显示了，这里再画一个可能会重复，但没关系
-            # 正常模式画实线矩形
-            painter.drawRect(self._selection)
+        painter = QPainter(self)
 
-    def _emit_area_from_rect(self, rect: QRect):
-        """将屏幕坐标的矩形映射回视频坐标并发射信号"""
-        if self._source_frame is None:
+        try:
+            painter.fillRect(self.rect(), QColor(20, 20, 20))
+
+            if self._pixmap is None:
+                return
+
+            scaled = self._pixmap.scaled(
+                self.size(),
+                Qt.KeepAspectRatio,
+                Qt.SmoothTransformation
+            )
+
+            x = (self.width() - scaled.width()) // 2
+            y = (self.height() - scaled.height()) // 2
+
+            self._video_rect = QRect(x, y, scaled.width(), scaled.height())
+
+            painter.drawPixmap(x, y, scaled)
+
+            if not self._selection_video.isNull():
+                rect = self._video_to_widget(self._selection_video)
+                self._draw_selection(painter, rect)
+
+            self._draw_guides(painter)
+
+        finally:
+            painter.end()
+
+    def _draw_guides(self, painter):
+        painter.setPen(QPen(QColor(255, 255, 255, 60), 1))
+
+        cx = self._video_rect.center().x()
+        cy = self._video_rect.center().y()
+
+        # 中心线
+        painter.drawLine(cx, self._video_rect.top(), cx, self._video_rect.bottom())
+        painter.drawLine(self._video_rect.left(), cy, self._video_rect.right(), cy)
+
+    # =========================
+    # Mouse
+    # =========================
+
+    def mousePressEvent(self, event):
+        if self._frame is None:
             return
-        img_h, img_w = self._source_frame.shape[:2]
-        label_w = self.width()
-        label_h = self.height()
-        scale = min(label_w / img_w, label_h / img_h)
-        offset_x = (label_w - img_w * scale) / 2
-        offset_y = (label_h - img_h * scale) / 2
 
-        video_x = int((rect.x() - offset_x) / scale)
-        video_y = int((rect.y() - offset_y) / scale)
-        video_w = int(rect.width() / scale)
-        video_h = int(rect.height() / scale)
+        pos = event.position().toPoint()
+        widget_rect = self._video_to_widget(self._selection_video)
 
-        # 限制不超出视频边界
-        video_x = max(0, min(video_x, img_w - 1))
-        video_y = max(0, min(video_y, img_h - 1))
-        video_w = max(1, min(video_w, img_w - video_x))
-        video_h = max(1, min(video_h, img_h - video_y))
+        handles = self._handle_rects(widget_rect)
 
-        self.area_selected.emit(video_x, video_y, video_w, video_h)
+        # resize
+        for name, h in handles.items():
+            if h.contains(pos):
+                self._resizing = True
+                self._resize_handle = name
+                self._origin = pos
+                return
+
+        # move
+        if widget_rect.contains(pos):
+            self._moving = True
+            self._drag_offset = pos - widget_rect.topLeft()
+            return
+
+        # create
+        if self._video_rect.contains(pos):
+            self._dragging = True
+            self._origin = pos
+            self._selection_video = QRect()
+
+    def mouseMoveEvent(self, event):
+        if self._frame is None:
+            return
+
+        pos = event.position().toPoint()
+
+        # =========================
+        # create
+        # =========================
+        if self._dragging:
+            rect = QRect(self._origin, pos).normalized()
+            rect = rect.intersected(self._video_rect)
+            self._selection_video = self._widget_to_video(rect)
+            self.update()
+            return
+
+        # =========================
+        # move + snap
+        # =========================
+        if self._moving:
+            rect = self._video_to_widget(self._selection_video)
+
+            new_top_left = pos - self._drag_offset
+            rect.moveTopLeft(self._snap(new_top_left))
+
+            self._selection_video = self._widget_to_video(rect)
+            self.update()
+            return
+
+        # =========================
+        # resize（Shift / Alt 支持）
+        # =========================
+        if self._resizing:
+            rect = self._video_to_widget(self._selection_video)
+            modifiers = QApplication.keyboardModifiers()
+            center = modifiers & Qt.AltModifier
+            aspect = modifiers & Qt.ShiftModifier
+            rect = self._apply_resize(rect, pos, center, aspect)
+            self._selection_video = self._widget_to_video(rect)
+            self.update()
+            return
+
+    def mouseReleaseEvent(self, event):
+        self._dragging = False
+        self._moving = False
+        self._resizing = False
+        self._resize_handle = None
+
+        r = self._selection_video
+
+        if r.width() > 0 and r.height() > 0:
+            self.area_selected.emit(r.x(), r.y(), r.width(), r.height())
+
+    # =========================
+    # Resize (Shift / Alt)
+    # =========================
+
+    def _apply_resize(self, rect, pos, center=False, aspect=False):
+        left = rect.left()
+        right = rect.right()
+        top = rect.top()
+        bottom = rect.bottom()
+
+        if self._resize_handle == "br":
+            right = pos.x()
+            bottom = pos.y()
+        elif self._resize_handle == "tr":
+            right = pos.x()
+            top = pos.y()
+        elif self._resize_handle == "bl":
+            left = pos.x()
+            bottom = pos.y()
+        elif self._resize_handle == "tl":
+            left = pos.x()
+            top = pos.y()
+
+        # 先设置为可能负的矩形
+        rect.setRect(left, top, right - left, bottom - top)
+
+        # 归一化，确保宽高为正
+        rect = rect.normalized()
+
+        if rect.width() < self.MIN_SIZE:
+            rect.setWidth(self.MIN_SIZE)
+        if rect.height() < self.MIN_SIZE:
+            rect.setHeight(self.MIN_SIZE)
+
+        # Shift 等比
+        if aspect:
+            w = rect.width()
+            h = rect.height()
+            if h > 0:
+                ratio = w / max(h, 1)
+                rect.setHeight(int(w / ratio))
+
+        # Alt 中心缩放
+        if center:
+            c = rect.center()
+            rect.moveCenter(c)
+
+        # 限制在视频区域内
+        rect = rect.intersected(self._video_rect)
+
+        return rect
+
+    # =========================
+    # Snap（吸附）
+    # =========================
+
+    def _snap(self, p: QPoint):
+        v = self._video_rect
+
+        x = p.x()
+        y = p.y()
+
+        if abs(x - v.left()) < self.SNAP_DIST:
+            x = v.left()
+        if abs(x - v.right()) < self.SNAP_DIST:
+            x = v.right()
+
+        if abs(y - v.top()) < self.SNAP_DIST:
+            y = v.top()
+        if abs(y - v.bottom()) < self.SNAP_DIST:
+            y = v.bottom()
+
+        return QPoint(x, y)
+
+    def _snap_rect(self, rect: QRect):
+        rect.moveTopLeft(self._snap(rect.topLeft()))
+        rect.moveBottomRight(self._snap(rect.bottomRight()))
+        return rect
+
+    # =========================
+    # Helpers（保持你原逻辑）
+    # =========================
+
+    def _handle_rects(self, rect):
+        s = self.HANDLE_SIZE
+
+        return {
+            "tl": QRect(rect.left()-s//2, rect.top()-s//2, s, s),
+            "tr": QRect(rect.right()-s//2, rect.top()-s//2, s, s),
+            "bl": QRect(rect.left()-s//2, rect.bottom()-s//2, s, s),
+            "br": QRect(rect.right()-s//2, rect.bottom()-s//2, s, s),
+        }
+
+    def _video_to_widget(self, rect):
+        if self._frame is None:
+            return QRect()
+
+        h, w = self._frame.shape[:2]
+
+        sx = self._video_rect.width() / w
+        sy = self._video_rect.height() / h
+
+        return QRect(
+            int(rect.x()*sx + self._video_rect.x()),
+            int(rect.y()*sy + self._video_rect.y()),
+            int(rect.width()*sx),
+            int(rect.height()*sy),
+        )
 
     def set_selection_by_video_coords(self, x, y, w, h):
-        """根据视频坐标设置选框并重绘（用于恢复保存的选区）"""
-        if self._source_frame is not None:
-            # 将视频坐标映射到 label 屏幕坐标
-            img_h, img_w = self._source_frame.shape[:2]
-            label_w = self.width()
-            label_h = self.height()
-            scale = min(label_w / img_w, label_h / img_h)
-            offset_x = (label_w - img_w * scale) / 2
-            offset_y = (label_h - img_h * scale) / 2
-
-            screen_x = int(x * scale + offset_x)
-            screen_y = int(y * scale + offset_y)
-            screen_w = int(w * scale)
-            screen_h = int(h * scale)
-
-            self._selection = QRect(screen_x, screen_y, screen_w, screen_h)
-        else:
-            # 还没加载视频，先存储视频坐标，等待 set_frame 后应用
-            self._pending_video_rect = (x, y, w, h)
+        self._selection_video = QRect(int(x), int(y), int(w), int(h))
         self.update()
+
+    def _widget_to_video(self, rect):
+        if self._frame is None:
+            return QRect()
+
+        h, w = self._frame.shape[:2]
+
+        sx = w / self._video_rect.width()
+        sy = h / self._video_rect.height()
+
+        return QRect(
+            int((rect.x()-self._video_rect.x())*sx),
+            int((rect.y()-self._video_rect.y())*sy),
+            int(rect.width()*sx),
+            int(rect.height()*sy),
+        )
+
+    def _draw_selection(self, painter, rect):
+        painter.setRenderHint(QPainter.Antialiasing)
+
+        # 半透明遮罩
+        painter.fillRect(rect, QColor(0, 255, 0, 40))
+
+        # 边框
+        painter.setPen(QPen(QColor(0, 255, 0), 2))
+        painter.drawRect(rect)
+
+        # handles
+        painter.setBrush(QBrush(QColor(255, 255, 255)))
+
+        for handle in self._handle_rects(rect).values():
+            painter.drawRect(handle)
