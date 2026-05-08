@@ -9,6 +9,7 @@ class VideoPlayer(QLabel):
 
     def __init__(self):
         super().__init__()
+        self._pending_video_rect = None
         self.setAlignment(Qt.AlignCenter)
         self.setMouseTracking(True)
         self.setStyleSheet("background-color: black;")
@@ -25,6 +26,9 @@ class VideoPlayer(QLabel):
     def set_frame(self, frame_bgr):
         self._source_frame = frame_bgr.copy()
         self._display_frame()
+        if hasattr(self, '_pending_video_rect') and self._pending_video_rect:
+            self.set_selection_by_video_coords(*self._pending_video_rect)
+            self._pending_video_rect = None
 
     def _display_frame(self):
         if self._source_frame is None:
@@ -138,3 +142,25 @@ class VideoPlayer(QLabel):
         video_h = max(1, min(video_h, img_h - video_y))
 
         self.area_selected.emit(video_x, video_y, video_w, video_h)
+
+    def set_selection_by_video_coords(self, x, y, w, h):
+        """根据视频坐标设置选框并重绘（用于恢复保存的选区）"""
+        if self._source_frame is not None:
+            # 将视频坐标映射到 label 屏幕坐标
+            img_h, img_w = self._source_frame.shape[:2]
+            label_w = self.width()
+            label_h = self.height()
+            scale = min(label_w / img_w, label_h / img_h)
+            offset_x = (label_w - img_w * scale) / 2
+            offset_y = (label_h - img_h * scale) / 2
+
+            screen_x = int(x * scale + offset_x)
+            screen_y = int(y * scale + offset_y)
+            screen_w = int(w * scale)
+            screen_h = int(h * scale)
+
+            self._selection = QRect(screen_x, screen_y, screen_w, screen_h)
+        else:
+            # 还没加载视频，先存储视频坐标，等待 set_frame 后应用
+            self._pending_video_rect = (x, y, w, h)
+        self.update()

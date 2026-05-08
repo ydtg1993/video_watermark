@@ -397,16 +397,21 @@ class MainWindow(QMainWindow):
         fps = self.cap.get(cv2.CAP_PROP_FPS)
         self.slider.setRange(0, max(0, self.total_frames - 1))
         self.slider.setEnabled(True)
+
+        # 先显示第一帧，这样播放器才能正确计算坐标
         self._show_frame(0)
-        self.confirm_rect_btn.setEnabled(True)
-        self.start_btn.setEnabled(False)
-        # 不清空 watermarm_rect，允许恢复上次矩形
+
+        # 恢复上次保存的选框区域
         if self.watermark_rect:
-            self.rect_label.setText(f"上次区域: x={self.watermark_rect[0]}, y={self.watermark_rect[1]}, "
-                                    f"宽={self.watermark_rect[2]}, 高={self.watermark_rect[3]}")
+            x, y, w, h = self.watermark_rect
+            self.player.set_selection_by_video_coords(x, y, w, h)  # 绘制选框
+            self.rect_label.setText(f"已恢复区域: x={x}, y={y}, 宽={w}, 高={h}")
             self.start_btn.setEnabled(True)
         else:
             self.rect_label.setText("未选择区域")
+            self.start_btn.setEnabled(False)
+
+        self.confirm_rect_btn.setEnabled(True)
 
     def _show_frame(self, idx):
         if self.cap is None:

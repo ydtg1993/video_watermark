@@ -14,30 +14,31 @@ class WatermarkAdder(QObject):
     status_updated = Signal(str)
     finished = Signal(bool, str)
 
-    def add_text(self, input_path: str, output_path: str,
-                 text: str, x: int, y: int, fontfile: str = "",
-                 fontsize: int = 24, fontcolor: str = "white",
-                 alpha: float = 1.0, bold: bool = False,
-                 italic: bool = False, angle: float = 0.0,
-                 encoder: str = "libx264", quality: str = "标准",
-                 remove_first: bool = False, remove_rect: tuple = None):
-        fontcolor_hex = self._color_to_hex(fontcolor)
+    def add_text(self, input_path, output_path, text, x, y, fontfile="",
+                 fontsize=24, fontcolor="white", alpha=1.0, bold=False,
+                 italic=False, angle=0.0, encoder="libx264", quality="标准",
+                 remove_first=False, remove_rect=None):
+        tmp = tempfile.NamedTemporaryFile(
+            mode='w', suffix='.txt', delete=False, encoding='utf-8')
+        try:
+            tmp.write(text)
+            tmp.close()
 
-        # === 关键：转义文本中的特殊字符 ===
-        # FFmpeg drawtext 要求 : 和 ' 和 \ 必须转义
-        safe_text = text.replace('\\', '\\\\')  # 反斜杠最先处理
-        safe_text = safe_text.replace(':', '\\:')
-        safe_text = safe_text.replace("'", "\\'")
-        # 基础滤镜串
-        vf = (
-            f"drawtext=text='{text}':x={x}:y={y}:"
-            f"fontsize={fontsize}:fontcolor={fontcolor_hex}@"
-            f"{alpha}:angle={angle}"
-        )
+            raw_path = tmp.name.replace('\\', '/')  # 路径统一
+            fontcolor_hex = self._color_to_hex(fontcolor)
+            vf = (
+                f"drawtext=textfile='{raw_path}':"
+                f"x={x}:y={y}:"
+                f"fontsize={fontsize}:fontcolor={fontcolor_hex}@"
+                f"{alpha}:angle={angle}"
+            )
 
-        self._process_segmented(input_path, output_path, vf,
-                                encoder, quality,
-                                remove_first, remove_rect)
+            self._process_segmented(input_path, output_path, vf,
+                                    encoder, quality,
+                                    remove_first, remove_rect)
+        finally:
+            if os.path.exists(tmp.name):
+                os.unlink(tmp.name)
 
     def add_image(self, input_path: str, output_path: str,
                   image_path: str, x: int, y: int,
@@ -45,7 +46,6 @@ class WatermarkAdder(QObject):
                   alpha: float = 1.0,
                   encoder: str = "libx264", quality: str = "标准",
                   remove_first: bool = False, remove_rect: tuple = None):
-        # 构建 overlay 滤镜部分
         if width > 0 and height > 0:
             scale_filter = f"[1:v]scale={width}:{height}[wm];"
             overlay_filter = f"[0:v][wm]overlay={x}:{y}:alpha={alpha}"
@@ -53,18 +53,13 @@ class WatermarkAdder(QObject):
             scale_filter = ""
             overlay_filter = f"[0:v][1:v]overlay={x}:{y}:alpha={alpha}"
 
-        # 如果需要先去水印，就在 overlay 前加入 delogo
         if remove_first and remove_rect:
             rx, ry, rw, rh = remove_rect
             delogo_filter = f"[0:v]delogo=x={rx}:y={ry}:w={rw}:h={rh}:show=0[base];"
-            # 调整 overlay 的输入流标签
             if scale_filter:
-                # scale_filter 用了 [1:v] 缩放为 [wm]，然后需要 overlay [base][wm]
-                # 组合：delogo_filter + scale_filter，overlay 改为 [base][wm]
                 overlay_part = f"[base][wm]overlay={x}:{y}:alpha={alpha}"
                 filter_complex = f"{delogo_filter}{scale_filter}{overlay_part}"
             else:
-                # 无缩放，overlay 原本是 [0:v][1:v]overlay
                 overlay_part = f"[base][1:v]overlay={x}:{y}:alpha={alpha}"
                 filter_complex = f"{delogo_filter}{overlay_part}"
         else:
@@ -87,7 +82,6 @@ class WatermarkAdder(QObject):
         temp_dir = tempfile.mkdtemp(prefix="adder_")
         segment_files = []
 
-        # 组合滤镜字符串
         if remove_first and remove_rect:
             rx, ry, rw, rh = remove_rect
             delogo = f"delogo=x={rx}:y={ry}:w={rw}:h={rh}:show=0"
@@ -163,6 +157,7 @@ class WatermarkAdder(QObject):
 
     def _run_segment_cmd(self, cmd, start_time, total_duration, seg_file):
         try:
+            print("DEBUG CMD:", " ".join(cmd))
             process = subprocess.Popen(
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 text=True, bufsize=1, universal_newlines=True
@@ -238,7 +233,7 @@ class WatermarkAdder(QObject):
                 return ["-c:v", vcodec, "-qp_i", "18", "-qp_p", "18", "-c:a", "aac", "-b:a", "128k"]
             else:
                 return ["-c:v", vcodec, "-qp_i", "23", "-qp_p", "23", "-c:a", "aac", "-b:a", "128k"]
-        else:  # libx264
+        else:
             if quality == "无损":
                 return ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "0", "-c:a", "aac", "-b:a", "128k"]
             elif quality == "高质量":
