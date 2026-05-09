@@ -186,35 +186,7 @@
 	QPushButton#applyButton:hover {
 	    background: #2ea043;
 	}
-	/* ===== 进度条 ===== */
-	QFrame#progressFrame {
-	    background: #0d1117;
-	    border-top: 1px solid #1c2330;
-	}
-	QLabel#progressLabel {
-	    color: #e6edf7;
-	}
-	QProgressBar#progressBar {
-	    background: #161b22;
-	    border: 1px solid #30363d;
-	    border-radius: 10px;
-	    text-align: center;
-	    height: 20px;
-	    color: #e6edf7;
-	}
-	QProgressBar#progressBar::chunk {
-	    background: #238636;
-	    border-radius: 10px;
-	}
-	QPushButton#cancelButton {
-	    background: #da3633;
-	    border: none;
-	    border-radius: 8px;
-	    color: white;
-	}
-	QPushButton#cancelButton:hover {
-	    background: #f85149;
-	}
+
 	/* ===== 设置面板 ===== */
 	QFrame#settingsPanel {
 	    background: #0d1117;

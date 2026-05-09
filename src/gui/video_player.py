@@ -1,4 +1,4 @@
-from PySide6.QtCore import Qt, QRect, QPoint, Signal
+from PySide6.QtCore import Qt, QRect, QPoint, Signal, Slot
 from PySide6.QtWidgets import QWidget, QApplication
 from PySide6.QtGui import QColor, QPainter, QPen, QPixmap, QImage, QBrush, QFont
 import cv2
@@ -13,7 +13,7 @@ class VideoPlayer(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setMouseTracking(True)
-        self._frame = None
+        self._frame = None              # 保留兼容，但不再用于框选条件
         self._pixmap = None
         self._video_rect = QRect()
         self._selection_video = QRect()
@@ -23,7 +23,8 @@ class VideoPlayer(QWidget):
         self._resize_handle = None
         self._origin = QPoint()
         self._drag_offset = QPoint()
-        self._preview_mode = 0  # 0: remove, 1: text, 2: image
+        self._preview_mode = 0          # 0: remove, 1: text, 2: image
+        self._video_size = (0, 0)       # 记录原始视频宽高
 
     def set_preview_mode(self, mode: int):
         self._preview_mode = mode
@@ -34,12 +35,22 @@ class VideoPlayer(QWidget):
         self.update()
 
     def set_frame(self, frame):
+        """旧版 cv2 frame 输入（保留兼容）"""
         self._frame = frame
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         h, w, ch = rgb.shape
         bytes_per_line = ch * w
         image = QImage(rgb.data, w, h, bytes_per_line, QImage.Format_RGB888)
         self._pixmap = QPixmap.fromImage(image)
+        self._video_size = (w, h)
+        self.update()
+
+    @Slot(QImage, int)
+    def set_qimage(self, img: QImage, idx: int):
+        """直接接收 FrameReader 传来的 QImage 渲染"""
+        self._frame = None               # 清空 cv2 帧缓存
+        self._pixmap = QPixmap.fromImage(img)
+        self._video_size = (img.width(), img.height())
         self.update()
 
     def paintEvent(self, event):
@@ -129,7 +140,8 @@ class VideoPlayer(QWidget):
 
     # ========== Mouse Events ==========
     def mousePressEvent(self, event):
-        if self._frame is None: return
+        if self._pixmap is None:        # 关键修改：不再依赖 _frame
+            return
         pos = event.position().toPoint()
         widget_rect = self._video_to_widget(self._selection_video)
         handles = self._handle_rects(widget_rect)
@@ -149,7 +161,8 @@ class VideoPlayer(QWidget):
             self._selection_video = QRect()
 
     def mouseMoveEvent(self, event):
-        if self._frame is None: return
+        if self._pixmap is None:
+            return
         pos = event.position().toPoint()
         if self._dragging:
             rect = QRect(self._origin, pos).normalized()
@@ -226,8 +239,9 @@ class VideoPlayer(QWidget):
         }
 
     def _video_to_widget(self, rect):
-        if self._frame is None: return QRect()
-        h, w = self._frame.shape[:2]
+        if self._pixmap is None or self._video_size == (0, 0):
+            return QRect()
+        w, h = self._video_size
         sx = self._video_rect.width() / w
         sy = self._video_rect.height() / h
         return QRect(
@@ -238,8 +252,9 @@ class VideoPlayer(QWidget):
         )
 
     def _widget_to_video(self, rect):
-        if self._frame is None: return QRect()
-        h, w = self._frame.shape[:2]
+        if self._pixmap is None or self._video_size == (0, 0):
+            return QRect()
+        w, h = self._video_size
         sx = w / self._video_rect.width()
         sy = h / self._video_rect.height()
         return QRect(

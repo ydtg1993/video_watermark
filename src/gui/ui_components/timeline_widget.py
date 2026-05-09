@@ -59,6 +59,7 @@ class TimelineWidget(QWidget):
         self.waveform_pixmap = None
         self._waveform_thread = None
         self.setStyleSheet("background-color: transparent;")  # 修复：透明背景
+        self.processing_progress = -1.0
 
     def set_duration(self, d):
         self.duration = max(d, 0.001)
@@ -103,11 +104,13 @@ class TimelineWidget(QWidget):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
         rect = self.rect()
+
         # 背景轨道
         track_rect = QRect(4, 20, rect.width() - 8, rect.height() - 36)
-        p.fillRect(track_rect, QColor("#161b22"))  # 深色轨道
+        p.fillRect(track_rect, QColor("#161b22"))
         p.setPen(QPen(QColor("#30363d"), 1))
         p.drawRoundedRect(track_rect, 4, 4)
+
         # 波形绘制
         if self.waveform_pixmap and not self.waveform_pixmap.isNull():
             wave_y = rect.height() // 2
@@ -116,18 +119,15 @@ class TimelineWidget(QWidget):
                 Qt.IgnoreAspectRatio, Qt.SmoothTransformation
             )
             p.drawPixmap(track_rect.x(), wave_y, scaled)
+
         # 播放头
         head_x = int(self.position * rect.width())
         p.setPen(QPen(QColor("#5ea2ff"), 2))
         p.drawLine(head_x, 0, head_x, rect.height())
-        # 三角箭头
-        triangle = QPolygon([
-            QPoint(head_x - 6, 0),
-            QPoint(head_x + 6, 0),
-            QPoint(head_x, 12)
-        ])
+        triangle = QPolygon([QPoint(head_x - 6, 0), QPoint(head_x + 6, 0), QPoint(head_x, 12)])
         p.setBrush(QBrush(QColor("#5ea2ff")))
         p.drawPolygon(triangle)
+
         # 时间刻度
         p.setPen(QColor("#484f58"))
         for i in range(11):
@@ -136,8 +136,31 @@ class TimelineWidget(QWidget):
             if i % 2 == 0:
                 sec = int(self.duration * i / 10)
                 p.drawText(x - 15, rect.height() - 2, f"{sec}s")
-        p.end()
+
+        # ========== 处理进度拨片（深红色，必须在 p.end() 之前） ==========
+        if self.processing_progress >= 0:
+            proc_x = int(self.processing_progress * rect.width())
+            # 深红色竖线
+            p.setPen(QPen(QColor(180, 0, 0, 200), 3))
+            p.drawLine(proc_x, 0, proc_x, rect.height())
+            # 三角箭头
+            arrow_tri = QPolygon([
+                QPoint(proc_x - 5, 0),
+                QPoint(proc_x + 5, 0),
+                QPoint(proc_x, 8)
+            ])
+            p.setBrush(QBrush(QColor(180, 0, 0, 220)))
+            p.setPen(Qt.NoPen)
+            p.drawPolygon(arrow_tri)
+
+        p.end()  # 所有绘制在此结束
 
     def clear_waveform(self):
         self.waveform_pixmap = None
         self.update()
+
+    def set_processing_progress(self, value: float):
+        """设置处理进度（0~1），-1 表示隐藏"""
+        self.processing_progress = max(0.0, min(1.0, value)) if value >= 0 else -1.0
+        self.update()
+

@@ -41,10 +41,7 @@ class SideBar(QFrame, UIBaseMixin):
         layout.addWidget(self.nav_settings_btn)
         layout.addStretch()
         # 底部工具
-        self.theme_btn = self.create_btn(
-            icon_text="🌙", tooltip="切换主题",
-            obj_name="themeButton"
-        )
+        self.theme_btn = self._add_icon("moon", tooltip="切换主题", obj_name="themeButton")
         layout.addWidget(self.theme_btn)
         self.version_label = QLabel("v1.0")
         self.version_label.setObjectName("versionLabel")
