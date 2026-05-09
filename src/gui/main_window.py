@@ -113,9 +113,8 @@ class MainWindow(QMainWindow):
         self.playback_ctrl.frame_changed.connect(self.video_panel.player.set_qimage)
         self.playback_ctrl.play_state_changed.connect(self.control_bar.set_play_icon)
         self.playback_ctrl.time_updated.connect(self.control_bar.update_time)
-        self.task_ctrl.progress_updated.connect(self.video_panel.update_progress)
         self.task_ctrl.progress_updated.connect(self._on_task_progress)
-        self.task_ctrl.status_updated.connect(lambda t: self.video_panel.update_progress(None, t))
+        self.task_ctrl.status_updated.connect(self._on_status_update)
         self.task_ctrl.task_started.connect(self._on_task_started)
         self.task_ctrl.task_finished.connect(self._on_task_finished)
 
@@ -308,4 +307,34 @@ class MainWindow(QMainWindow):
                 img = QImage(rgb.data, w, h, bytes_per_line, QImage.Format_RGB888).copy()
                 self.video_panel.player.set_qimage(img, total - 1)
                 self.control_bar.set_play_icon(False)
+        cap.release()
+
+    @Slot(str)
+    def _on_status_update(self, text):
+        if text.startswith("segment_complete:"):
+            seg_file = text.split(":", 1)[1]
+            self._show_segment_last_frame(seg_file)
+        else:
+            self.video_panel.update_progress(None, text)
+
+    def _show_segment_last_frame(self, seg_file: str):
+        """读取切片的第一帧并显示到播放器（处理过程中预览）"""
+        if not seg_file or not os.path.exists(seg_file):
+            return
+        # 停止播放器的帧刷新
+        self.playback_ctrl.frame_reader.pause()
+        self.playback_ctrl.is_playing = False
+
+        cap = cv2.VideoCapture(seg_file)
+        if not cap.isOpened():
+            cap.release()
+            return
+        # 直接读第一帧，不需要跳转
+        ret, frame = cap.read()
+        if ret:
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            h, w, ch = rgb.shape
+            bytes_per_line = ch * w
+            img = QImage(rgb.data, w, h, bytes_per_line, QImage.Format_RGB888).copy()
+            self.video_panel.player.set_qimage(img, 0)  # 帧索引 0
         cap.release()

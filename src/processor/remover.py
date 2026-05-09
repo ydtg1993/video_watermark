@@ -55,6 +55,7 @@ class WatermarkRemover(BaseProcessor):
                     self.finished.emit(False, f"片段处理失败：\n{err}")
                     return
                 segment_files.append(seg_file)
+                self.status_updated.emit(f"segment_complete:{seg_file}")
             if not self._concat_segments(segment_files, temp_dir, output_path, encoder, quality):
                 raise RuntimeError("视频合并失败")
             self.progress_updated.emit(100)

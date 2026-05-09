@@ -99,6 +99,9 @@ class WatermarkAdder(BaseProcessor):
                     self.finished.emit(False, f"片段 {i + 1} 处理失败\n{error_info}")
                     return
                 segment_files.append(seg_file)
+                self.status_updated.emit(f"segment_complete:{seg_file}")
+                segment_end = min((i + 1) * self.SEGMENT_TIME, duration)
+                self.progress_updated.emit(int((segment_end / duration) * 100))
             if not self._concat_segments(segment_files, temp_dir, output_path, encoder, quality):
                 raise RuntimeError("视频合并失败")
             self.progress_updated.emit(100)
