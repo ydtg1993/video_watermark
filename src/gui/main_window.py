@@ -1,673 +1,548 @@
+"""
+主窗口 - 协调者模式
+职责：组装组件、连接信号、编排业务流程
+不包含任何 UI 构建细节，全部委托给子组件
+"""
 import os
+import datetime
 import cv2
-import traceback
-
+from pathlib import Path
 from PySide6.QtCore import (
-    Qt,
-    QThread,
-    QSettings,
-    Slot
+    Qt, QThread, QSettings, Slot, Signal, QTimer
 )
-
+from PySide6.QtGui import QFont, QDesktopServices, QShortcut, QKeySequence
 from PySide6.QtWidgets import (
-    QMainWindow,
-    QWidget,
-    QVBoxLayout,
-    QHBoxLayout,
-    QPushButton,
-    QSlider,
-    QFileDialog,
-    QLabel,
-    QMessageBox,
-    QGroupBox,
-    QRadioButton,
-    QLineEdit,
-    QSpinBox,
-    QDoubleSpinBox,
-    QComboBox,
-    QCheckBox,
-    QFontComboBox,
-    QApplication
+    QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QMessageBox, QDialog, QListWidget, QListWidgetItem,
+    QDialogButtonBox, QAbstractItemView, QApplication, QLabel, QPushButton, QFileDialog
 )
-
+# 导入 UI 组件
+from .ui_components.side_bar import SideBar
+from .ui_components.top_toolbar import TopToolbar
+from .ui_components.video_panel import VideoPanel
+from .ui_components.control_bar import ControlBar
+from .ui_components.settings_panel import SettingsPanel
 from .video_player import VideoPlayer
-from .progress_dialog import ProgressDialog
-
+from ..core.gpu_monitor import GPUMonitor
+# 导入业务层
 from ..processor.remover import WatermarkRemover
 from ..processor.watermark_adder import WatermarkAdder
-
 from ..core.logger import logger
-from ..core.utils import get_best_encoder
+from ..core.history_manager import HistoryManager
+from ..core.theme_manager import ThemeManager
+
+
+class HistoryDialog(QDialog):
+    """历史任务弹窗（轻量级）"""
+    def __init__(self, history_data, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("历史任务")
+        self.resize(650, 450)
+        self.parent_ref = parent
+        self.history_data = history_data
+        self._setup_ui()
+
+    def _setup_ui(self):
+        layout = QVBoxLayout(self)
+        self.list_widget = QListWidget()
+        self.list_widget.setAlternatingRowColors(True)
+        self.list_widget.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.list_widget.itemDoubleClicked.connect(self._open_file_location)
+        layout.addWidget(self.list_widget)
+        btn_box = QDialogButtonBox()
+        clear_btn = QPushButton("清空历史")
+        clear_btn.clicked.connect(self._clear_history)
+        close_btn = QPushButton("关闭")
+        close_btn.clicked.connect(self.accept)
+        btn_box.addButton(clear_btn, QDialogButtonBox.ActionRole)
+        btn_box.addButton(close_btn, QDialogButtonBox.RejectRole)
+        layout.addWidget(btn_box)
+        self._refresh_list()
+
+    def _refresh_list(self):
+        self.list_widget.clear()
+        for rec in reversed(self.history_data):
+            text = f"[{rec.get('time', '')}] {rec.get('status', '')}: {Path(rec.get('output', '')).name}"
+            item = QListWidgetItem(text)
+            item.setData(Qt.UserRole, rec.get("output", ""))
+            self.list_widget.addItem(item)
+
+    def _open_file_location(self, item):
+        file_path = item.data(Qt.UserRole)
+        if file_path and Path(file_path).exists():
+            QDesktopServices.openUrl(Path(file_path).parent.as_uri())
+        else:
+            QMessageBox.information(self, "提示", "文件不存在或已被移动")
+
+    def _clear_history(self):
+        reply = QMessageBox.question(self, "确认", "确定要清空所有历史记录吗？",
+                                     QMessageBox.Yes | QMessageBox.No)
+        if reply == QMessageBox.Yes:
+            self.history_data.clear()
+            if hasattr(self.parent_ref, 'history_manager'):
+                self.parent_ref.history_manager.save_history(self.history_data)
+            self._refresh_list()
 
 
 class MainWindow(QMainWindow):
+    """主窗口 - 纯粹的协调者"""
+
     def __init__(self):
         super().__init__()
-
         self.setWindowTitle("视频去/加水印工具")
-        self.resize(1400, 900)
+        self.resize(1600, 960)
+        self.setMinimumSize(1400, 860)
+        # 1. 初始化服务与数据
+        self._init_services()
+        self._init_state()
+        # 2. 构建 UI（组合模式）
+        self._build_ui()
+        # 3. 连接信号
+        self._connect_signals()
+        self._setup_shortcuts()
+        # 4. 恢复状态
+        self.settings_panel.load_settings(self.app_settings)
+        self._apply_theme(self.theme_manager.current_theme)
 
+    def _init_services(self):
+        """初始化服务层"""
+        self.history_manager = HistoryManager()
+        self.theme_manager = ThemeManager()
+        self.app_settings = QSettings("JVSClaw", "WatermarkTool")
+        self.history_records = self.history_manager.load_history()
+
+    def _init_state(self):
+        """初始化业务状态"""
         self.video_path = None
         self.cap = None
-
         self.total_frames = 0
         self.current_frame_idx = 0
-
         self.watermark_rect = None
-
         self.processing = False
-
         self.worker_thread = None
         self.worker = None
+        self.is_playing = False
+        # 播放定时器
+        self.play_timer = QTimer(self)
+        self.play_timer.setInterval(40)
+        self.play_timer.timeout.connect(self._next_frame)
 
-        self.progress_dialog = None
-
-        self.settings = QSettings("JVSClaw", "WatermarkTool")
-
-        self._setup_ui()
-        self._connect_signals()
-        self._load_settings()
-
-    # =========================================================
-    # UI
-    # =========================================================
-
-    def _setup_ui(self):
+    def _build_ui(self):
+        """组装 UI 组件（Builder Pattern）"""
         central = QWidget()
         self.setCentralWidget(central)
-
         root = QHBoxLayout(central)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
 
-        # ======================
-        # Left
-        # ======================
-        left_layout = QVBoxLayout()
+        # 左侧导航栏 - 注入 theme_manager
+        self.sidebar = SideBar(self.theme_manager)
+        root.addWidget(self.sidebar)
 
-        self.player = VideoPlayer()
-        left_layout.addWidget(self.player, 1)
+        # 中间工作区容器
+        self.main_content = QWidget()
+        self.main_content.setObjectName("mainContent")
+        main_layout = QVBoxLayout(self.main_content)
+        main_layout.setContentsMargins(16, 12, 16, 12)
+        main_layout.setSpacing(12)
 
-        slider_layout = QHBoxLayout()
+        # 顶部工具栏 - 注入 theme_manager
+        self.toolbar = TopToolbar(self.theme_manager)
+        main_layout.addWidget(self.toolbar)
 
-        self.slider = QSlider(Qt.Horizontal)
-        self.slider.setEnabled(False)
+        # 视频预览区（含进度覆盖层）
+        self.video_panel = VideoPanel()
+        main_layout.addWidget(self.video_panel, 1)
 
-        self.time_label = QLabel("00:00:00 / 00:00:00")
+        # 底部控制栏 - 注入 theme_manager
+        self.control_bar = ControlBar(self.theme_manager)
+        main_layout.addWidget(self.control_bar)
 
-        slider_layout.addWidget(self.slider)
-        slider_layout.addWidget(self.time_label)
+        root.addWidget(self.main_content, 1)
 
-        left_layout.addLayout(slider_layout)
+        # 右侧属性面板
+        self.settings_panel = SettingsPanel()
+        root.addWidget(self.settings_panel)
 
-        btn_layout = QHBoxLayout()
+        # 状态栏
+        self.status_label = QLabel("准备就绪")
+        self.status_label.setObjectName("statusBar")
+        self.statusBar().addWidget(self.status_label, 1)
 
-        self.open_btn = QPushButton("打开视频")
-        self.confirm_rect_btn = QPushButton("确认区域")
-        self.start_btn = QPushButton("开始处理")
+        # GPU 监控指示器
+        from .ui_components.gpu_indicator import GPUIndicator
+        self.gpu_indicator = GPUIndicator()
+        self.statusBar().addPermanentWidget(self.gpu_indicator)
 
-        self.confirm_rect_btn.setEnabled(False)
-        self.start_btn.setEnabled(False)
-
-        btn_layout.addWidget(self.open_btn)
-        btn_layout.addWidget(self.confirm_rect_btn)
-        btn_layout.addStretch()
-        btn_layout.addWidget(self.start_btn)
-
-        left_layout.addLayout(btn_layout)
-
-        self.info_label = QLabel("提示：拖拽框选区域，可移动/缩放选框")
-        left_layout.addWidget(self.info_label)
-
-        root.addLayout(left_layout, 2)
-
-        # ======================
-        # Right
-        # ======================
-        settings_panel = self._create_settings_panel()
-        root.addWidget(settings_panel, 1)
-
-    def _create_settings_panel(self):
-        group = QGroupBox("设置")
-        layout = QVBoxLayout(group)
-
-        # ======================
-        # mode
-        # ======================
-        mode_row = QHBoxLayout()
-        mode_row.addWidget(QLabel("模式"))
-        self.mode_combo = QComboBox()
-        self.mode_combo.addItems(["去水印", "加文字水印", "加图片水印"])
-        mode_row.addWidget(self.mode_combo)
-        layout.addLayout(mode_row)
-
-        # ======================
-        # rect
-        # ======================
-        self.rect_label = QLabel("未选择区域")
-        layout.addWidget(self.rect_label)
-
-        # ======================
-        # text watermark
-        # ======================
-        self.text_group = QGroupBox("文字水印")
-        text_layout = QVBoxLayout(self.text_group)
-
-        text_layout.addWidget(QLabel("文字"))
-        self.text_input = QLineEdit("我的水印")
-        text_layout.addWidget(self.text_input)
-
-        font_row = QHBoxLayout()
-        font_row.addWidget(QLabel("字体"))
-        self.font_combo = QFontComboBox()
-        font_row.addWidget(self.font_combo)
-        text_layout.addLayout(font_row)
-
-        color_row = QHBoxLayout()
-        color_row.addWidget(QLabel("颜色"))
-        self.color_combo = QComboBox()
-        self.color_combo.addItems([
-            "white", "black", "red", "green", "blue", "yellow", "cyan"
-        ])
-        color_row.addWidget(self.color_combo)
-        text_layout.addLayout(color_row)
-
-        alpha_row = QHBoxLayout()
-        alpha_row.addWidget(QLabel("透明度"))
-        self.text_alpha = QDoubleSpinBox()
-        self.text_alpha.setRange(0.0, 1.0)
-        self.text_alpha.setSingleStep(0.1)
-        self.text_alpha.setValue(0.8)
-        alpha_row.addWidget(self.text_alpha)
-        text_layout.addLayout(alpha_row)
-
-        angle_row = QHBoxLayout()
-        angle_row.addWidget(QLabel("旋转"))
-        self.angle_spin = QDoubleSpinBox()
-        self.angle_spin.setRange(-360, 360)
-        angle_row.addWidget(self.angle_spin)
-        text_layout.addLayout(angle_row)
-
-        # ---- 新增：字体文件选择 (解决中文方框) ----
-        fontfile_row = QHBoxLayout()
-        fontfile_row.addWidget(QLabel("字体文件"))
-        self.fontfile_edit = QLineEdit()
-        self.fontfile_edit.setReadOnly(True)
-        self.fontfile_browse_btn = QPushButton("浏览")
-        fontfile_row.addWidget(self.fontfile_edit)
-        fontfile_row.addWidget(self.fontfile_browse_btn)
-        text_layout.addLayout(fontfile_row)
-        # -----------------------------------------
-
-        layout.addWidget(self.text_group)
-
-        # ======================
-        # image watermark
-        # ======================
-        self.image_group = QGroupBox("图片水印")
-        image_layout = QVBoxLayout(self.image_group)
-
-        img_row = QHBoxLayout()
-        self.img_path_edit = QLineEdit()
-        self.img_path_edit.setReadOnly(True)
-        self.img_browse_btn = QPushButton("浏览")
-        img_row.addWidget(self.img_path_edit)
-        img_row.addWidget(self.img_browse_btn)
-        image_layout.addLayout(img_row)
-
-        scale_row = QHBoxLayout()
-        scale_row.addWidget(QLabel("缩放"))
-        self.scale_combo = QComboBox()
-        self.scale_combo.addItems(["适应区域", "原始大小"])
-        scale_row.addWidget(self.scale_combo)
-        image_layout.addLayout(scale_row)
-
-        alpha2_row = QHBoxLayout()
-        alpha2_row.addWidget(QLabel("透明度"))
-        self.img_alpha = QDoubleSpinBox()
-        self.img_alpha.setRange(0.0, 1.0)
-        self.img_alpha.setSingleStep(0.1)
-        self.img_alpha.setValue(0.9)
-        alpha2_row.addWidget(self.img_alpha)
-        image_layout.addLayout(alpha2_row)
-
-        layout.addWidget(self.image_group)
-
-        # ======================
-        # encoder
-        # ======================
-        output_group = QGroupBox("输出")
-        output_layout = QVBoxLayout(output_group)
-
-        enc_row = QHBoxLayout()
-        enc_row.addWidget(QLabel("编码器"))
-        self.encoder_combo = QComboBox()
-        self.encoder_combo.addItems(["nvenc", "qsv", "amf", "libx264"])
-        self.encoder_combo.setCurrentText(get_best_encoder())
-        enc_row.addWidget(self.encoder_combo)
-        output_layout.addLayout(enc_row)
-
-        quality_row = QHBoxLayout()
-        quality_row.addWidget(QLabel("质量"))
-        self.quality_combo = QComboBox()
-        self.quality_combo.addItems(["标准", "高质量", "无损"])
-        quality_row.addWidget(self.quality_combo)
-        output_layout.addLayout(quality_row)
-
-        layout.addWidget(output_group)
-
-        # ======================
-        # option
-        # ======================
-        self.remove_before_add_check = QCheckBox("先去原水印再添加")
-        layout.addWidget(self.remove_before_add_check)
-
-        layout.addStretch()
-        self._update_mode_ui()
-
-        return group
-
-    # =========================================================
-    # signals
-    # =========================================================
+        self.time_label = QLabel("")
+        self.time_label.setObjectName("statusTime")
+        self.statusBar().addPermanentWidget(self.time_label)
 
     def _connect_signals(self):
-        self.open_btn.clicked.connect(self._open_video)
-        self.slider.valueChanged.connect(self._slider_changed)
-        self.player.area_selected.connect(self._on_area_selected)
-        self.confirm_rect_btn.clicked.connect(self._confirm_rect)
-        self.start_btn.clicked.connect(self._start_process)
-        self.mode_combo.currentIndexChanged.connect(self._update_mode_ui)
-        self.img_browse_btn.clicked.connect(self._browse_image)
-        self.fontfile_browse_btn.clicked.connect(self._browse_font)
+        """建立清晰的信号映射表"""
+        # === 导航栏 ===
+        self.sidebar.nav_history_btn.clicked.connect(self._show_history)
+        self.sidebar.theme_btn.clicked.connect(self._toggle_theme)
+        # === 工具栏 ===
+        self.toolbar.open_btn.clicked.connect(self._open_video)
+        self.toolbar.start_btn.clicked.connect(self._start_process)
+        self.toolbar.theme_toggle.clicked.connect(self._toggle_theme)
+        # === 视频面板 ===
+        self.video_panel.player.area_selected.connect(self._on_area_selected)
+        self.video_panel.cancel_btn.clicked.connect(self._cancel_task)
+        # === 控制栏 ===
+        self.control_bar.play_btn.clicked.connect(self._toggle_play)
+        self.control_bar.prev_btn.clicked.connect(lambda: self._seek_frame(-1))
+        self.control_bar.next_btn.clicked.connect(lambda: self._seek_frame(1))
+        self.control_bar.seek_requested.connect(self._on_timeline_seek)
+        # === 设置面板（ROI 双向绑定）===
+        sp = self.settings_panel
+        sp.mode_combo.currentIndexChanged.connect(self._on_mode_changed)
+        sp.spin_x.valueChanged.connect(self._on_roi_spinbox_changed)
+        sp.spin_y.valueChanged.connect(self._on_roi_spinbox_changed)
+        sp.spin_w.valueChanged.connect(self._on_roi_spinbox_changed)
+        sp.spin_h.valueChanged.connect(self._on_roi_spinbox_changed)
+        sp.clear_rect_btn.clicked.connect(self._clear_rect)
+        sp.apply_rect_btn.clicked.connect(self._confirm_rect)
+        # 浏览按钮
+        sp.img_browse_btn.clicked.connect(self._browse_image)
+        sp.fontfile_btn.clicked.connect(self._browse_font)
+        sp.output_browse_btn.clicked.connect(self._browse_output_path)
 
-    # =========================================================
-    # settings
-    # =========================================================
+    @Slot(float)
+    def _on_timeline_seek(self, pos):
+        """时间轴拖动跳转"""
+        if self.total_frames > 0:
+            idx = int(pos * (self.total_frames - 1))
+            self._show_frame(idx)
 
-    def _load_settings(self):
-        mode = self.settings.value("mode", 0, type=int)
-        self.mode_combo.setCurrentIndex(mode)
+    # ==================== 业务逻辑处理 ====================
+    @Slot(int, int, int, int)
+    def _on_area_selected(self, x, y, w, h):
+        """视频区域选择回调 -> 同步到设置面板"""
+        self.watermark_rect = (x, y, w, h)
+        self.settings_panel.set_roi_values(x, y, w, h)
+        self.toolbar.set_processing_enabled(True)
 
-        self.text_input.setText(self.settings.value("text", "我的水印"))
-        font = self.settings.value("font", "")
-        if font:
-            idx = self.font_combo.findText(font)
-            if idx >= 0:
-                self.font_combo.setCurrentIndex(idx)
-        color = self.settings.value("color", "white")
-        idx = self.color_combo.findText(color)
-        if idx >= 0:
-            self.color_combo.setCurrentIndex(idx)
-        self.text_alpha.setValue(self.settings.value("text_alpha", 0.8, type=float))
-        self.angle_spin.setValue(self.settings.value("angle", 0.0, type=float))
-        self.fontfile_edit.setText(self.settings.value("fontfile", ""))
+    def _on_roi_spinbox_changed(self):
+        """坐标框数值改变 -> 同步到视频预览"""
+        x, y, w, h = self.settings_panel.get_roi_values()
+        # 处理锁定比例逻辑
+        if self.settings_panel.lock_ratio_btn.isChecked() and self.watermark_rect:
+            old_w, old_h = self.watermark_rect[2], self.watermark_rect[3]
+            if old_w > 0 and old_h > 0:
+                ratio = old_h / old_w
+                sender = self.sender()
+                if sender == self.settings_panel.spin_w:
+                    h = int(w * ratio)
+                    self.settings_panel.spin_h.blockSignals(True)
+                    self.settings_panel.spin_h.setValue(h)
+                    self.settings_panel.spin_h.blockSignals(False)
+                elif sender == self.settings_panel.spin_h:
+                    w = int(h / ratio)
+                    self.settings_panel.spin_w.blockSignals(True)
+                    self.settings_panel.spin_w.setValue(w)
+                    self.settings_panel.spin_w.blockSignals(False)
+        self.watermark_rect = (x, y, w, h)
+        self.video_panel.player.set_selection_by_video_coords(x, y, w, h)
+        self.toolbar.set_processing_enabled(w > 0 and h > 0)
 
-        self.img_path_edit.setText(self.settings.value("image_path", ""))
-        scale = self.settings.value("scale_mode", 0, type=int)
-        self.scale_combo.setCurrentIndex(scale)
-        self.img_alpha.setValue(self.settings.value("img_alpha", 0.9, type=float))
+    @Slot(int)
+    def _on_mode_changed(self, index):
+        """模式切换 -> 更新 UI 可见性"""
+        self.settings_panel.update_mode_visibility(index)
+        self.video_panel.player.set_preview_mode(index)
 
-        enc = self.settings.value("encoder", "libx264")
-        idx = self.encoder_combo.findText(enc)
-        if idx >= 0:
-            self.encoder_combo.setCurrentIndex(idx)
-        qual = self.settings.value("quality", "标准")
-        idx = self.quality_combo.findText(qual)
-        if idx >= 0:
-            self.quality_combo.setCurrentIndex(idx)
+    def _clear_rect(self):
+        """清除选区"""
+        self.watermark_rect = None
+        self.video_panel.player.clear_selection()
+        self.settings_panel.clear_roi()
+        self.toolbar.set_processing_enabled(False)
 
-        self.remove_before_add_check.setChecked(
-            self.settings.value("remove_before_add", False, type=bool)
-        )
+    def _confirm_rect(self):
+        """确认选区（视觉反馈）"""
+        if not self.watermark_rect:
+            QMessageBox.warning(self, "提示", "请先框选区域")
+            return
+        self.video_panel.player.update()
 
-        rect_list = self.settings.value("watermark_rect")
-        if rect_list and len(rect_list) == 4:
-            self.watermark_rect = tuple(rect_list)
+    def _toggle_play(self):
+        """播放/暂停切换"""
+        if not self.cap:
+            return
+        if self.is_playing:
+            self.play_timer.stop()
         else:
-            self.watermark_rect = None
+            fps = self.cap.get(cv2.CAP_PROP_FPS) or 25
+            self.play_timer.start(int(1000 / fps))
+        self.is_playing = not self.is_playing
+        self.control_bar.set_play_icon(self.is_playing)
 
-        self._update_mode_ui()
-
-    def _save_settings(self):
-        self.settings.setValue("mode", self.mode_combo.currentIndex())
-        self.settings.setValue("text", self.text_input.text())
-        self.settings.setValue("font", self.font_combo.currentText())
-        self.settings.setValue("color", self.color_combo.currentText())
-        self.settings.setValue("text_alpha", self.text_alpha.value())
-        self.settings.setValue("angle", self.angle_spin.value())
-        self.settings.setValue("fontfile", self.fontfile_edit.text())
-
-        self.settings.setValue("image_path", self.img_path_edit.text())
-        self.settings.setValue("scale_mode", self.scale_combo.currentIndex())
-        self.settings.setValue("img_alpha", self.img_alpha.value())
-
-        self.settings.setValue("encoder", self.encoder_combo.currentText())
-        self.settings.setValue("quality", self.quality_combo.currentText())
-        self.settings.setValue("remove_before_add", self.remove_before_add_check.isChecked())
-
-        if self.watermark_rect:
-            self.settings.setValue("watermark_rect", list(self.watermark_rect))
+    def _next_frame(self):
+        """播放下一帧"""
+        if self.current_frame_idx < self.total_frames - 1:
+            self._show_frame(self.current_frame_idx + 1)
         else:
-            self.settings.remove("watermark_rect")
+            self._toggle_play()
 
-    # =========================================================
-    # mode ui
-    # =========================================================
+    def _seek_frame(self, offset):
+        """快进/快退"""
+        if not self.cap:
+            return
+        new_idx = max(0, min(self.total_frames - 1, self.current_frame_idx + offset))
+        self._show_frame(new_idx)
 
-    def _update_mode_ui(self):
-        idx = self.mode_combo.currentIndex()
-        self.text_group.setVisible(idx == 1)
-        self.image_group.setVisible(idx == 2)
-
-    # =========================================================
-    # open video
-    # =========================================================
+    def _show_frame(self, idx):
+        """显示指定帧（核心渲染方法）"""
+        if not self.cap:
+            return
+        self.cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+        ret, frame = self.cap.read()
+        if not ret:
+            return
+        self.current_frame_idx = idx
+        self.video_panel.player.set_frame(frame)
+        # 更新控制栏状态
+        fps = self.cap.get(cv2.CAP_PROP_FPS) or 25
+        cur_sec = idx / fps
+        total_sec = self.total_frames / fps
+        self.control_bar.update_time(cur_sec, total_sec)
+        self.control_bar.update_slider(idx, self.total_frames)
 
     def _open_video(self):
+        """打开视频文件"""
         path, _ = QFileDialog.getOpenFileName(
-            self, "选择视频", "", "Video (*.mp4 *.avi *.mov *.mkv *.flv)"
+            self, "选择视频", "",
+            "Video (*.mp4 *.avi *.mov *.mkv *.flv);;All Files (*)"
         )
         if not path:
             return
-
         try:
             if self.cap:
                 self.cap.release()
             self.cap = cv2.VideoCapture(path)
             if not self.cap.isOpened():
-                raise RuntimeError("无法打开视频")
+                raise RuntimeError("无法打开视频文件")
             self.video_path = path
             self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            self.slider.setEnabled(True)
-            self.slider.setRange(0, max(0, self.total_frames - 1))
-            self.confirm_rect_btn.setEnabled(True)
-
+            fps = self.cap.get(cv2.CAP_PROP_FPS) or 25
+            w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            self.toolbar.update_video_info(Path(path).name, w, h, fps)
+            self.control_bar.enable_controls(True)
+            self.control_bar.update_slider(0, self.total_frames)
             self._show_frame(0)
-
-            # 恢复选框
             if self.watermark_rect:
-                x, y, w, h = self.watermark_rect
-                self.player.set_selection_by_video_coords(x, y, w, h)
-                self.rect_label.setText(f"x={x}, y={y}, w={w}, h={h}")
-                self.start_btn.setEnabled(True)
+                x, y, rw, rh = self.watermark_rect
+                self.video_panel.player.set_selection_by_video_coords(x, y, rw, rh)
+                self.toolbar.set_processing_enabled(True)
             else:
-                self.rect_label.setText("未选择区域")
-                self.start_btn.setEnabled(False)
-
-            logger.info("video opened: %s", path)
-
+                self._clear_rect()
+            self.status_label.setText(f"已加载: {Path(path).name}")
+            logger.info("视频打开成功: %s (%dx%d@%.2ffps)", path, w, h, fps)
+            if hasattr(self.control_bar, 'timeline'):
+                self.control_bar.timeline.generate_waveform(path)
         except Exception as e:
-            logger.exception(e)
-            QMessageBox.critical(self, "错误", str(e))
-
-    # =========================================================
-    # frame
-    # =========================================================
-
-    def _show_frame(self, idx):
-        if not self.cap:
-            return
-
-        self.cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
-        ret, frame = self.cap.read()
-
-        if not ret:
-            return
-
-        self.current_frame_idx = idx
-        self.player.set_frame(frame)
-
-        self.slider.blockSignals(True)
-        self.slider.setValue(idx)
-        self.slider.blockSignals(False)
-
-        fps = self.cap.get(cv2.CAP_PROP_FPS)
-        if fps <= 0:
-            fps = 25
-
-        cur = idx / fps
-        total = self.total_frames / fps
-        self.time_label.setText(
-            f"{self._sec_to_hms(cur)} / {self._sec_to_hms(total)}"
-        )
-
-    def _slider_changed(self, value):
-        self._show_frame(value)
-
-    # =========================================================
-    # area
-    # =========================================================
-
-    @Slot(int, int, int, int)
-    def _on_area_selected(self, x, y, w, h):
-        self.watermark_rect = (x, y, w, h)
-        self.rect_label.setText(f"x={x}, y={y}, w={w}, h={h}")
-        self.start_btn.setEnabled(True)
-
-    def _confirm_rect(self):
-        if not self.watermark_rect:
-            QMessageBox.warning(self, "提示", "请先框选区域")
-            return
-        QMessageBox.information(self, "确认", str(self.watermark_rect))
-
-    # =========================================================
-    # image & font browse
-    # =========================================================
-
-    def _browse_image(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, "选择图片", "", "Image (*.png *.jpg *.jpeg *.bmp)"
-        )
-        if path:
-            self.img_path_edit.setText(path)
-
-    def _browse_font(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, "选择字体文件", "", "字体文件 (*.ttf *.otf)"
-        )
-        if path:
-            self.fontfile_edit.setText(path)
-
-    # =========================================================
-    # process
-    # =========================================================
+            logger.exception("打开视频失败")
+            QMessageBox.critical(self, "错误", f"无法打开视频:\n{str(e)}")
 
     def _start_process(self):
+        """启动处理任务（核心业务流程）"""
         if self.processing:
             return
-
         if not self.video_path:
-            QMessageBox.warning(self, "提示", "请先打开视频")
+            QMessageBox.warning(self, "提示", "请先打开视频文件")
             return
-
-        if not self.watermark_rect:
-            QMessageBox.warning(self, "提示", "请先框选区域")
+        mode = self.settings_panel.current_mode
+        valid, err_msg = self.settings_panel.validate_for_processing(mode)
+        if not valid:
+            QMessageBox.warning(self, "配置错误", err_msg)
             return
-
-        save_path, _ = QFileDialog.getSaveFileName(
-            self, "保存视频", "output.mp4", "MP4 (*.mp4)"
-        )
-        if not save_path:
-            return
-
+        out_cfg = self.settings_panel.get_output_config()
+        base_name = Path(self.video_path).stem
+        save_path = os.path.join(out_cfg['path'], f"{base_name}_processed.{out_cfg['format']}")
+        if os.path.exists(save_path):
+            reply = QMessageBox.question(
+                self, "文件已存在",
+                f"输出文件已存在:\n{save_path}\n\n是否覆盖？",
+                QMessageBox.Yes | QMessageBox.No
+            )
+            if reply != QMessageBox.Yes:
+                return
+        if hasattr(self, 'gpu_indicator'):
+            self.gpu_indicator.start_monitoring()
         self.processing = True
-        self.start_btn.setEnabled(False)
-
-        self.progress_dialog = ProgressDialog(self)
-        self.progress_dialog.show()
-        QApplication.processEvents()
-
-        x, y, w, h = self.watermark_rect
-        encoder = self.encoder_combo.currentText()
-        quality = self.quality_combo.currentText()
-        mode = self.mode_combo.currentIndex()
-
+        self.toolbar.set_processing_enabled(False)
+        self.video_panel.show_progress(True)
+        self.video_panel.reset_progress()
+        self.control_bar.enable_controls(False)
+        x, y, w, h = self.settings_panel.get_roi_values()
         self.worker_thread = QThread()
-
         try:
-            if mode == 0:  # 去水印
+            if mode == 0:
                 self.worker = WatermarkRemover()
-                self.worker.moveToThread(self.worker_thread)
-                self.worker_thread.started.connect(
-                    lambda: self.worker.remove(
-                        self.video_path, save_path, x, y, w, h,
-                        encoder, quality
-                    )
+                self.worker.setup_remove(
+                    input_path=self.video_path, output_path=save_path,
+                    x=x, y=y, width=w, height=h,
+                    encoder=out_cfg['encoder'], quality=out_cfg['quality']
                 )
-
-            elif mode == 1:  # 加文字水印
+            elif mode == 1:
+                txt_cfg = self.settings_panel.get_text_watermark_config()
                 self.worker = WatermarkAdder()
-                self.worker.moveToThread(self.worker_thread)
-                self.worker_thread.started.connect(
-                    lambda: self.worker.add_text(
-                        input_path=self.video_path,
-                        output_path=save_path,
-                        text=self.text_input.text(),
-                        x=x, y=y,
-                        fontsize=0,   # 自适应
-                        fontcolor=self.color_combo.currentText(),
-                        alpha=self.text_alpha.value(),
-                        fontfile=self.fontfile_edit.text().strip() or "",
-                        encoder=encoder,
-                        quality=quality,
-                        remove_first=self.remove_before_add_check.isChecked(),
-                        remove_rect=self.watermark_rect,
-                        rect=self.watermark_rect
-                    )
+                self.worker.setup_add_text(
+                    input_path=self.video_path, output_path=save_path,
+                    text=txt_cfg['text'], x=x, y=y,
+                    fontsize=0, fontcolor=txt_cfg['color'],
+                    alpha=txt_cfg['alpha'], fontfile=txt_cfg['fontfile'],
+                    encoder=out_cfg['encoder'], quality=out_cfg['quality'],
+                    remove_first=out_cfg['remove_first'],
+                    remove_rect=self.watermark_rect, rect=self.watermark_rect
                 )
-
-            else:  # 加图片水印
-                image_path = self.img_path_edit.text().strip()
-                if not image_path:
-                    QMessageBox.warning(self, "错误", "请选择图片")
-                    self.processing = False
-                    self.start_btn.setEnabled(True)
-                    return
-
+            else:
+                img_cfg = self.settings_panel.get_image_watermark_config()
+                scale_w, scale_h = (w, h) if img_cfg['scale_mode'] == 0 else (0, 0)
                 self.worker = WatermarkAdder()
-                self.worker.moveToThread(self.worker_thread)
-                if self.scale_combo.currentIndex() == 0:
-                    scale_w, scale_h = w, h
-                else:
-                    scale_w, scale_h = 0, 0
-                self.worker_thread.started.connect(
-                    lambda: self.worker.add_image(
-                        input_path=self.video_path,
-                        output_path=save_path,
-                        image_path=image_path,
-                        x=x, y=y,
-                        width=scale_w,
-                        height=scale_h,
-                        alpha=self.img_alpha.value(),
-                        encoder=encoder,
-                        quality=quality,
-                        remove_first=self.remove_before_add_check.isChecked(),
-                        remove_rect=self.watermark_rect
-                    )
+                self.worker.setup_add_image(
+                    input_path=self.video_path, output_path=save_path,
+                    image_path=img_cfg['path'], x=x, y=y,
+                    width=scale_w, height=scale_h, alpha=img_cfg['alpha'],
+                    encoder=out_cfg['encoder'], quality=out_cfg['quality'],
+                    remove_first=out_cfg['remove_first'],
+                    remove_rect=self.watermark_rect
                 )
-
-            # 通用信号连接
-            self.worker.progress_updated.connect(self.progress_dialog.set_progress)
-            self.worker.status_updated.connect(self.progress_dialog.set_status)
+            self.worker.moveToThread(self.worker_thread)
+            self.worker_thread.started.connect(self.worker.run)
+            self.worker.progress_updated.connect(self._on_progress)
+            self.worker.status_updated.connect(self._on_status_update)
             self.worker.finished.connect(self._on_finished)
-            self.progress_dialog.cancel_btn.clicked.connect(self._cancel_task)
-
             self.worker_thread.start()
-
         except Exception as e:
-            if self.worker_thread:
-                self.worker_thread.deleteLater()
-                self.worker_thread = None
-            logger.exception(e)
-            traceback.print_exc()
-            self.processing = False
-            self.start_btn.setEnabled(True)
-            QMessageBox.critical(self, "错误", str(e))
+            logger.exception("启动处理任务失败")
+            self._on_finished(False, str(e))
 
-    # =========================================================
-    # cancel
-    # =========================================================
+    @Slot(int)
+    def _on_progress(self, value):
+        self.video_panel.update_progress(value)
 
-    def _cancel_task(self):
-        try:
-            if self.worker:
-                self.worker.cancel()
-        except Exception as e:
-            logger.exception(e)
-
-    # =========================================================
-    # finished
-    # =========================================================
+    @Slot(str)
+    def _on_status_update(self, text):
+        self.video_panel.update_progress(None, text)
 
     @Slot(bool, str)
     def _on_finished(self, success, message):
         self.processing = False
-        self.start_btn.setEnabled(True)
-
-        # 关闭进度对话框
-        if self.progress_dialog:
-            self.progress_dialog.close()
-            self.progress_dialog = None
-
-        # 先退出工作线程，等待完成
         if self.worker_thread and self.worker_thread.isRunning():
             self.worker_thread.quit()
-            self.worker_thread.wait(5000)
-
-        # 安全释放 worker 对象
+            self.worker_thread.wait(3000)
         if self.worker:
             self.worker.deleteLater()
             self.worker = None
-
-        # 释放线程对象
         if self.worker_thread:
             self.worker_thread.deleteLater()
             self.worker_thread = None
-
-        self.activateWindow()
-        self.raise_()
-
-        if success:
-            QMessageBox.information(self, "完成", f"处理完成：\n{message}")
+        if hasattr(self, 'gpu_indicator'):
+            self.gpu_indicator.stop_monitoring()
+        self.toolbar.set_processing_enabled(True)
+        self.video_panel.show_progress(False)
+        self.control_bar.enable_controls(True)
+        if success and self.video_path:
+            self._add_history(self.video_path, message, "成功")
+            self.status_label.setText("处理完成")
+            QMessageBox.information(self, "完成", f"处理完成！\n\n{message}")
         else:
-            QMessageBox.critical(self, "错误", message)
+            self.status_label.setText("处理失败")
+            QMessageBox.critical(self, "错误", f"处理失败:\n\n{message}")
 
-    # =========================================================
-    # close
-    # =========================================================
-
-    def closeEvent(self, event):
-        self._save_settings()
-
-        # 取消正在运行的任务
+    def _cancel_task(self):
         if self.worker:
             self.worker.cancel()
+        self.video_panel.update_progress(None, "正在取消...")
 
-        # 请求线程退出并等待
+    def _browse_image(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "选择水印图片", "",
+            "Images (*.png *.jpg *.jpeg *.bmp *.webp);;All Files (*)"
+        )
+        if path:
+            self.settings_panel.img_path_edit.setText(path)
+
+    def _browse_font(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "选择字体文件", "",
+            "Font Files (*.ttf *.otf *.ttc);;All Files (*)"
+        )
+        if path:
+            self.settings_panel.fontfile_edit.setText(path)
+
+    def _browse_output_path(self):
+        dir_path = QFileDialog.getExistingDirectory(
+            self, "选择输出目录",
+            self.settings_panel.output_path_edit.text()
+        )
+        if dir_path:
+            self.settings_panel.output_path_edit.setText(dir_path)
+
+    # ==================== 主题与历史 ====================
+    def _toggle_theme(self):
+        """切换深色/浅色主题"""
+        new_theme = "light" if self.theme_manager.current_theme == "dark" else "dark"
+        self.theme_manager.set_theme(new_theme)
+        self._apply_theme(new_theme)
+        # 图标刷新已在 _apply_theme 中统一处理，不再单独设置文字
+
+    def _apply_theme(self, theme_name):
+        """应用主题样式并刷新所有图标"""
+        qss = self.theme_manager.load_stylesheet(theme_name)
+        if qss:
+            QApplication.instance().setStyleSheet(qss)
+        # 刷新各组件的图标
+        self.sidebar.refresh_all_icons()
+        self.toolbar.refresh_all_icons()
+        self.control_bar.refresh_all_icons()
+        QApplication.processEvents()
+
+    def _show_history(self):
+        dlg = HistoryDialog(self.history_records, self)
+        dlg.exec()
+
+    def _add_history(self, source, output, status):
+        rec = {
+            "time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "source": source,
+            "output": output,
+            "status": status
+        }
+        self.history_records.append(rec)
+        self.history_manager.save_history(self.history_records)
+
+    # ==================== 快捷键 ====================
+    def _setup_shortcuts(self):
+        QShortcut(QKeySequence(Qt.Key_Space), self, self._toggle_play)
+        QShortcut(QKeySequence(Qt.Key_Left), self, lambda: self._seek_frame(-1))
+        QShortcut(QKeySequence(Qt.Key_Right), self, lambda: self._seek_frame(1))
+        QShortcut(QKeySequence("Ctrl+O"), self, self._open_video)
+        QShortcut(QKeySequence(Qt.Key_Delete), self, self._clear_rect)
+
+    @Slot(dict)
+    def _on_gpu_data_updated(self, data: dict):
+        self.gpu_indicator.update_data(data)
+
+    # ==================== 生命周期 ====================
+    def closeEvent(self, event):
+        self.settings_panel.save_settings(self.app_settings)
+        if self.processing:
+            self._cancel_task()
         if self.worker_thread and self.worker_thread.isRunning():
             self.worker_thread.quit()
             if not self.worker_thread.wait(3000):
-                # 超时则强制终止
-                self.worker_thread.terminate()
-                self.worker_thread.wait()
-
-        # 释放视频资源
+                logger.warning("工作线程等待超时")
+        if hasattr(self, 'gpu_indicator'):
+            self.gpu_indicator.stop_monitoring()
         try:
             if self.cap:
                 self.cap.release()
                 self.cap = None
         except Exception:
             pass
-
         super().closeEvent(event)
-
-    # =========================================================
-    # utils
-    # =========================================================
-
-    @staticmethod
-    def _sec_to_hms(seconds):
-        seconds = int(seconds)
-        h = seconds // 3600
-        m = (seconds % 3600) // 60
-        s = seconds % 60
-        return f"{h:02}:{m:02}:{s:02}"
