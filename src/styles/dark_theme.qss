@@ -193,7 +193,7 @@
 	    border-left: 1px solid #1c2330;
 	}
 	QGroupBox {
-	    background: #161b22;
+
 	    border: 1px solid #30363d;
 	    border-radius: 12px;
 	    margin-top: 12px;
@@ -206,12 +206,10 @@
 	    left: 16px;
 	    top: -10px;
 	    padding: 4px 12px;
-	    background: #0d1117;
 	    border-radius: 8px;
 	    color: #5ea2ff;
 	}
 	QLabel#regionLabel {
-	    background: #0d1117;
 	    padding: 8px 12px;
 	    border-radius: 8px;
 	    color: #5ea2ff;
@@ -222,7 +220,7 @@
 	QComboBox,
 	QFontComboBox,
 	QDoubleSpinBox {
-	    background: #161b22;
+	    background: transparent;
 	    border: 1px solid #30363d;
 	    border-radius: 10px;
 	    padding: 10px 14px;
