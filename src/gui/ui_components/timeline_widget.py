@@ -2,13 +2,14 @@
 增强版时间轴 - 支持音频波形可视化
 """
 from PySide6.QtWidgets import QWidget
-from PySide6.QtCore import Qt, QRect, Signal, QThread, QPoint, Slot  # 修复：添加 Slot
+from PySide6.QtCore import Qt, QRect, Signal, QThread, QPoint, Slot
 from PySide6.QtGui import QPainter, QColor, QPixmap, QImage, QBrush, QPen, QPolygon
 
 
 class WaveformGenerator(QThread):
     """后台生成波形图"""
     waveform_ready = Signal(object)
+    finished = Signal()
 
     def __init__(self, video_path, width=1200, height=80):
         super().__init__()
@@ -43,7 +44,7 @@ class WaveformGenerator(QThread):
         except Exception as e:
             print(f"Waveform generation failed: {e}")
         finally:
-            self.deleteLater()
+            self.finished.emit()
 
 
 class TimelineWidget(QWidget):
@@ -58,7 +59,7 @@ class TimelineWidget(QWidget):
         self.thumbnails = []
         self.waveform_pixmap = None
         self._waveform_thread = None
-        self.setStyleSheet("background-color: transparent;")  # 修复：透明背景
+        self.setStyleSheet("background-color: transparent;")
         self.processing_progress = -1.0
 
     def set_duration(self, d):
@@ -75,17 +76,25 @@ class TimelineWidget(QWidget):
 
     def generate_waveform(self, video_path):
         if self._waveform_thread and self._waveform_thread.isRunning():
-            return
+            self._waveform_thread.quit()
+            self._waveform_thread.wait(1000)
         self._waveform_thread = WaveformGenerator(
             video_path, width=self.width() or 800, height=60
         )
         self._waveform_thread.waveform_ready.connect(self._on_waveform_ready)
+        self._waveform_thread.finished.connect(self._on_thread_finished)
         self._waveform_thread.start()
 
-    @Slot(object)  # 修复：使用 pyqtSignal 对应的 Slot 装饰器
+    @Slot(object)
     def _on_waveform_ready(self, pixmap):
         self.waveform_pixmap = pixmap
         self.update()
+
+    @Slot()
+    def _on_thread_finished(self):
+        if self._waveform_thread:
+            self._waveform_thread.deleteLater()
+            self._waveform_thread = None
 
     def mousePressEvent(self, e):
         if e.button() == Qt.LeftButton:
@@ -105,10 +114,10 @@ class TimelineWidget(QWidget):
         p.setRenderHint(QPainter.Antialiasing)
         rect = self.rect()
 
-        # 背景轨道
+        # 轨道背景 - 适配深色主题
         track_rect = QRect(4, 20, rect.width() - 8, rect.height() - 36)
-        p.fillRect(track_rect, QColor("#161b22"))
-        p.setPen(QPen(QColor("#30363d"), 1))
+        p.fillRect(track_rect, QColor("#2a2a2a"))
+        p.setPen(QPen(QColor("#444444"), 1))
         p.drawRoundedRect(track_rect, 4, 4)
 
         # 波形绘制
@@ -128,8 +137,8 @@ class TimelineWidget(QWidget):
         p.setBrush(QBrush(QColor("#5ea2ff")))
         p.drawPolygon(triangle)
 
-        # 时间刻度
-        p.setPen(QColor("#484f58"))
+        # 时间刻度 - 更淡的灰色
+        p.setPen(QColor("#777777"))
         for i in range(11):
             x = int(rect.width() * i / 10)
             p.drawLine(x, rect.height() - 12, x, rect.height() - 8)
@@ -137,13 +146,11 @@ class TimelineWidget(QWidget):
                 sec = int(self.duration * i / 10)
                 p.drawText(x - 15, rect.height() - 2, f"{sec}s")
 
-        # ========== 处理进度拨片（深红色，必须在 p.end() 之前） ==========
+        # 处理进度拨片
         if self.processing_progress >= 0:
             proc_x = int(self.processing_progress * rect.width())
-            # 深红色竖线
             p.setPen(QPen(QColor(180, 0, 0, 200), 3))
             p.drawLine(proc_x, 0, proc_x, rect.height())
-            # 三角箭头
             arrow_tri = QPolygon([
                 QPoint(proc_x - 5, 0),
                 QPoint(proc_x + 5, 0),
@@ -153,14 +160,12 @@ class TimelineWidget(QWidget):
             p.setPen(Qt.NoPen)
             p.drawPolygon(arrow_tri)
 
-        p.end()  # 所有绘制在此结束
+        p.end()
 
     def clear_waveform(self):
         self.waveform_pixmap = None
         self.update()
 
     def set_processing_progress(self, value: float):
-        """设置处理进度（0~1），-1 表示隐藏"""
         self.processing_progress = max(0.0, min(1.0, value)) if value >= 0 else -1.0
         self.update()
-

@@ -98,3 +98,21 @@ class BaseProcessor(QObject):
             if self._process.returncode != 0 or not os.path.exists(output_path):
                 return False
         return True
+
+    @staticmethod
+    def merge_audio_to_video(original_video, video_without_audio, output_path):
+        """将原视频的音频合并到新视频中"""
+        import subprocess
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", video_without_audio,
+            "-i", original_video,
+            "-c:v", "copy",
+            "-c:a", "aac",
+            "-map", "0:v:0",
+            "-map", "1:a:0",
+            "-shortest",
+            output_path
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        return result.returncode == 0 and os.path.exists(output_path)

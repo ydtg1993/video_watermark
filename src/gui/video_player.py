@@ -13,7 +13,7 @@ class VideoPlayer(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setMouseTracking(True)
-        self._frame = None              # 保留兼容，但不再用于框选条件
+        self._frame = None
         self._pixmap = None
         self._video_rect = QRect()
         self._selection_video = QRect()
@@ -23,8 +23,8 @@ class VideoPlayer(QWidget):
         self._resize_handle = None
         self._origin = QPoint()
         self._drag_offset = QPoint()
-        self._preview_mode = 0          # 0: remove, 1: text, 2: image
-        self._video_size = (0, 0)       # 记录原始视频宽高
+        self._preview_mode = 0
+        self._video_size = (0, 0)
 
     def set_preview_mode(self, mode: int):
         self._preview_mode = mode
@@ -35,7 +35,6 @@ class VideoPlayer(QWidget):
         self.update()
 
     def set_frame(self, frame):
-        """旧版 cv2 frame 输入（保留兼容）"""
         self._frame = frame
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         h, w, ch = rgb.shape
@@ -47,8 +46,7 @@ class VideoPlayer(QWidget):
 
     @Slot(QImage, int)
     def set_qimage(self, img: QImage, idx: int):
-        """直接接收 FrameReader 传来的 QImage 渲染"""
-        self._frame = None               # 清空 cv2 帧缓存
+        self._frame = None
         self._pixmap = QPixmap.fromImage(img)
         self._video_size = (img.width(), img.height())
         self.update()
@@ -56,8 +54,11 @@ class VideoPlayer(QWidget):
     def paintEvent(self, event):
         painter = QPainter(self)
         try:
-            painter.fillRect(self.rect(), QColor(8, 10, 14))
-            painter.setPen(QPen(QColor(50, 58, 72), 1))
+            # 背景和边框使用与深色主题协调的颜色
+            bg_color = QColor("#1e1e1e")
+            border_color = QColor("#3a3a3a")
+            painter.fillRect(self.rect(), bg_color)
+            painter.setPen(QPen(border_color, 1))
             painter.drawRoundedRect(self.rect().adjusted(0, 0, -1, -1), 14, 14)
             if self._pixmap is None:
                 return
@@ -82,7 +83,6 @@ class VideoPlayer(QWidget):
 
     def _draw_selection(self, painter, rect):
         painter.setRenderHint(QPainter.Antialiasing)
-        # 外部暗化
         overlay = QColor(0, 0, 0, 120)
         painter.fillRect(QRect(self._video_rect.left(), self._video_rect.top(), self._video_rect.width(),
                                rect.top() - self._video_rect.top()), overlay)
@@ -92,7 +92,6 @@ class VideoPlayer(QWidget):
             QRect(self._video_rect.left(), rect.top(), rect.left() - self._video_rect.left(), rect.height()), overlay)
         painter.fillRect(QRect(rect.right(), rect.top(), self._video_rect.right() - rect.right(), rect.height()),
                          overlay)
-        # 内部视觉预览层
         painter.setPen(Qt.NoPen)
         if self._preview_mode == 0:
             painter.setBrush(QColor(255, 50, 50, 60))
@@ -101,17 +100,14 @@ class VideoPlayer(QWidget):
         else:
             painter.setBrush(QColor(50, 255, 50, 60))
         painter.drawRect(rect)
-        # 预览文字
         painter.setPen(QColor(255, 255, 255, 200))
         painter.setFont(QFont("Microsoft YaHei", 12))
         text = "🚫 Remove" if self._preview_mode == 0 else "T Text" if self._preview_mode == 1 else "🖼 Image"
         painter.drawText(rect, Qt.AlignCenter, text)
-        # 主边框
         blue = QColor(59, 130, 246)
         painter.setPen(QPen(blue, 2))
         painter.setBrush(Qt.NoBrush)
         painter.drawRoundedRect(rect, 4, 4)
-        # 九宫格
         painter.setPen(QPen(QColor(255, 255, 255, 70), 1, Qt.DotLine))
         x1 = rect.left() + rect.width() // 3
         x2 = rect.left() + rect.width() * 2 // 3
@@ -121,7 +117,6 @@ class VideoPlayer(QWidget):
         painter.drawLine(x2, rect.top(), x2, rect.bottom())
         painter.drawLine(rect.left(), y1, rect.right(), y1)
         painter.drawLine(rect.left(), y2, rect.right(), y2)
-        # 角落装饰
         painter.setPen(QPen(blue, 4))
         corner = 20
         painter.drawLine(rect.left(), rect.top(), rect.left() + corner, rect.top())
@@ -132,15 +127,13 @@ class VideoPlayer(QWidget):
         painter.drawLine(rect.left(), rect.bottom() - corner, rect.left(), rect.bottom())
         painter.drawLine(rect.right() - corner, rect.bottom(), rect.right(), rect.bottom())
         painter.drawLine(rect.right(), rect.bottom() - corner, rect.right(), rect.bottom())
-        # Handles
         painter.setBrush(QBrush(QColor(255, 255, 255)))
         painter.setPen(QPen(blue, 2))
         for handle in self._handle_rects(rect).values():
             painter.drawEllipse(handle)
 
-    # ========== Mouse Events ==========
     def mousePressEvent(self, event):
-        if self._pixmap is None:        # 关键修改：不再依赖 _frame
+        if self._pixmap is None:
             return
         pos = event.position().toPoint()
         widget_rect = self._video_to_widget(self._selection_video)
@@ -196,7 +189,6 @@ class VideoPlayer(QWidget):
         if r.width() > 0 and r.height() > 0:
             self.area_selected.emit(r.x(), r.y(), r.width(), r.height())
 
-    # ========== Helpers ==========
     def _apply_resize(self, rect, pos, center=False, aspect=False):
         left, top, right, bottom = rect.left(), rect.top(), rect.right(), rect.bottom()
         if self._resize_handle == "br":

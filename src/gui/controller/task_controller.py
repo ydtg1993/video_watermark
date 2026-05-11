@@ -18,8 +18,8 @@ class TaskController(QObject):
         self.worker_thread = None
         self.worker = None
 
-    @Slot(dict, str, int, tuple)
-    def start_process(self, out_cfg: dict, video_path: str, mode: int, watermark_rect: tuple):
+    @Slot(dict, str, int, tuple, object)  # remove_cfg can be None
+    def start_process(self, out_cfg: dict, video_path: str, mode: int, watermark_rect: tuple, remove_cfg=None):
         if self.processing: return
         base_name = os.path.splitext(os.path.basename(video_path))[0]
         save_path = os.path.join(out_cfg['path'], f"{base_name}_processed.{out_cfg['format']}")
@@ -33,7 +33,8 @@ class TaskController(QObject):
                 self.worker.setup_remove(
                     input_path=video_path, output_path=save_path,
                     x=x, y=y, width=w, height=h,
-                    encoder=out_cfg['encoder'], quality=out_cfg['quality']
+                    encoder=out_cfg['encoder'], quality=out_cfg['quality'],
+                    remove_config=remove_cfg
                 )
             elif mode == 1:
                 self.worker = WatermarkAdder()

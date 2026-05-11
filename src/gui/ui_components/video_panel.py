@@ -4,15 +4,13 @@
 """
 from PySide6.QtWidgets import (
     QFrame, QVBoxLayout, QHBoxLayout, QLabel,
-    QProgressBar, QPushButton
+    QProgressBar
 )
+from qfluentwidgets import PushButton, FluentIcon as FIF
 from ..video_player import VideoPlayer
-from .base import UIBaseMixin
 
 
-class VideoPanel(QFrame, UIBaseMixin):
-    cancel_clicked = None  # 信号
-
+class VideoPanel(QFrame):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._setup_ui()
@@ -35,10 +33,8 @@ class VideoPanel(QFrame, UIBaseMixin):
         self.progress_bar = QProgressBar()
         self.progress_bar.setObjectName("progressBar")
         self.progress_bar.setTextVisible(True)
-        self.cancel_btn = self.create_btn(
-            text="取消", obj_name="cancelButton",
-            fixed_size=(80, 28)
-        )
+        self.cancel_btn = PushButton(FIF.CANCEL, "取消")
+        self.cancel_btn.setFixedSize(80, 28)
         prog_layout.addWidget(self.progress_label)
         prog_layout.addWidget(self.progress_bar, 1)
         prog_layout.addWidget(self.cancel_btn)

@@ -8,7 +8,9 @@ setup(
     install_requires=[
         'PySide6>=6.6.0',
         'opencv-python>=4.9.0',
-        'numpy>=1.26.0'
+        'numpy>=1.26.0',
+        'qfluentwidgets>=1.5.0',
+        'pywin32>=305'
     ],
     entry_points={
         'console_scripts': [

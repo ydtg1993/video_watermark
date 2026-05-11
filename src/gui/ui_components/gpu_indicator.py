@@ -42,10 +42,10 @@ class GPUIndicator(QFrame):
     def start_monitoring(self):
         """开始监控"""
         if not self._monitor:
-            self._monitor = GPUMonitor(interval=2.0)  # 2秒刷新一次
+            self._monitor = GPUMonitor(interval=2.0)
             self._monitor.data_updated.connect(self._on_gpu_data)
             self._monitor.start()
-            self._update_timer.start(2000)  # 备用定时器
+            self._update_timer.start(2000)
 
     def stop_monitoring(self):
         """停止监控"""
@@ -62,22 +62,23 @@ class GPUIndicator(QFrame):
         self.gpu_label.setText(f"{gpu}%")
         self.encoder_label.setText(f"ENC:{enc}%")
         self.temp_label.setText(f"🌡{temp}°")
-        # 根据负载改变颜色提示
+        # 根据负载动态设置文字颜色（使用调色板，不污染全局样式）
         if gpu > 80 or enc > 80:
-            self.setStyleSheet("QLabel#gpuValue { color: #f85149; }")
+            color = Qt.red
         elif gpu > 50:
-            self.setStyleSheet("QLabel#gpuValue { color: #d29922; }")
+            color = Qt.yellow
         else:
-            self.setStyleSheet("")
+            color = Qt.green
+        self.gpu_label.setStyleSheet("")
+        pal = self.gpu_label.palette()
+        pal.setColor(self.gpu_label.foregroundRole(), color)
+        self.gpu_label.setPalette(pal)
 
     def _update_display(self):
-        """备用更新（当 monitor 无数据时）"""
-        pass  # 主要由 signal 驱动
+        pass
 
     def showEvent(self, event):
         super().showEvent(event)
-        # 可选：显示时自动启动
 
     def hideEvent(self, event):
         super().hideEvent(event)
-        # 可选：隐藏时自动停止以节省资源
